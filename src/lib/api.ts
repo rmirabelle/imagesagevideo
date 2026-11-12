@@ -28,6 +28,8 @@ export interface Clip {
   status: ClipStatus;
   file: string | null;
   error: string | null;
+  /** The user removed this finished clip from the list. */
+  cleared: boolean;
 }
 
 export interface LayerJob {
@@ -36,16 +38,16 @@ export interface LayerJob {
   name: string;
   prompt: string;
   clips: Clip[];
+  /** The layer's video: its clips, joined. The clips have no files of their own then. */
+  video: string | null;
 }
 
 export interface Job {
   document: string;
   outputDir: string;
-  combine: boolean;
   clipWidth: number;
   clipHeight: number;
   layers: LayerJob[];
-  combined: string | null;
 }
 
 export type RunState = "idle" | "running" | "paused" | "finished";
@@ -82,7 +84,8 @@ export interface ModelFiles {
 export interface Settings {
   files: ModelFiles;
   outputDir: string;
-  combine: boolean;
+  /** How many 5-second clips each layer's video had in the last job. */
+  clipsPerLayer: number;
 }
 
 export interface SettingsView {
@@ -109,12 +112,13 @@ export interface FoundModels {
 
 export const openDocument = (path: string) => invoke<DocumentInfo>("open_document", { path });
 export const queueGet = () => invoke<Snapshot>("queue_get");
-export const queueStart = (request: { document: string; outputDir: string; combine: boolean; tiles: string[] }) =>
+export const queueStart = (request: { document: string; outputDir: string; clips: number; tiles: string[] }) =>
   invoke<void>("queue_start", { request });
 export const queuePause = () => invoke<void>("queue_pause");
 export const queueResume = () => invoke<void>("queue_resume");
 export const queueClear = () => invoke<void>("queue_clear");
-export const settingsGet = () => invoke<SettingsView>("settings_get");
+export const queueClearDone = () => invoke<void>("queue_clear_done");
+export const settingsGet =() => invoke<SettingsView>("settings_get");
 export const settingsSet = (settings: Settings) => invoke<void>("settings_set", { settings });
 export const settingsFromImageSage = () => invoke<ModelFiles>("settings_from_image_sage");
 export const engineStatus = () => invoke<EngineStatus>("engine_status");

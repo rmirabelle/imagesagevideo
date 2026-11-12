@@ -1,14 +1,14 @@
 # Image Sage Video
 
-Makes short video clips from every layer of an [Image Sage](https://github.com/rmirabelle/imagesage) document, on your own computer, with Wan 2.2.
+Makes a video from every layer of an [Image Sage](https://github.com/rmirabelle/imagesage) document, on your own computer, with Wan 2.2.
 
-You open a `.imagesage` document and choose a folder. For each layer, Image Sage Video makes three 5-second clips. Each clip starts from the layer's picture, and the layer's prompt tells Wan 2.2 what happens. The job runs in the background; the window can hide in the tray.
+You open a `.imagesage` document and choose a folder. For each layer, Image Sage Video makes one video. You choose how many 5-second clips the video has. The first clip starts from the layer's picture. Each clip after it starts from the last picture of the clip before. The layer's prompt tells Wan 2.2 what happens in all of them. The job runs in the background; the window can hide in the tray.
 
 ## Features
 
-- **Three clips for each layer** — small clips (within 832 × 480, in the document's shape), 5 seconds, 16 pictures each second, saved as WebM files.
+- **One video for each layer** — you choose the number of 5-second clips (1 to 20). The clips are small (within 832 × 480, in the document's shape), with 16 pictures each second. Two clips make a 10-second video.
+- **Clips that continue one another** — when a clip is done, its last picture becomes the first picture of the next clip. When all clips of a layer are done, they are joined into one WebM file and the clips are deleted. The clips are not encoded again, so the join is fast and loses no quality.
 - **Choose the layers** — every layer is on at the start; turn off the ones you do not want.
-- **Combined video** — an option joins all the clips, in order, into one WebM file, with no fade between them. The clips are not encoded again, so the join is fast and loses no quality.
 - **Pause and resume** — Pause stops the clip in work and removes the model from the GPU memory. Resume loads the model and makes that clip again from its start.
 - **Tray icon** — a minimized window hides to the tray. A dot on the tray icon shows the state: orange while videos are made, green when the job is finished, gray while it is paused. The tooltip shows the progress, and the menu can pause the job and go on with it.
 - **A job continues after a restart** — the job list is saved after each clip. If the app closes during a job, the job waits, paused, at the next start.
@@ -17,7 +17,7 @@ You open a `.imagesage` document and choose a folder. For each layer, Image Sage
 
 ## File names
 
-`<document>-<layer number>-<layer name>-<1 to 3>.webm`, and `<document>-combined.webm`. A file that exists is never replaced; the new file gets a number at its end.
+`<document>-<layer number>-<layer name>.webm` for a layer's video. While the video is in work, its clips are `<document>-<layer number>-<layer name>-<clip number>.webm`; they are deleted when the video is made. A file that exists is never replaced; the new file gets a number at its end.
 
 ## Requirements
 

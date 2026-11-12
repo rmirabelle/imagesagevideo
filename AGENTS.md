@@ -39,8 +39,16 @@
   `src-tauri/src/document.rs` and `src/editor/document.ts`.
 - `src-tauri/src/clip_size.rs` must give the same sizes as Image Sage's
   `src/editor/clipSize.ts`.
-- `src-tauri/src/webm.rs` joins clips without encoding them again. All clips
-  of one job have the document's shape, so their tracks match.
+- Each layer becomes one video of 1 to 20 clips. Clip 1 starts from the
+  layer's picture; each later clip starts from the last picture of the clip
+  before (`src-tauri/src/last_frame.rs`). The engine's clips are VP8 key
+  pictures only, so that picture is read with the WebP decoder and no video
+  decoder is necessary.
+- `src-tauri/src/webm.rs` joins a layer's clips without encoding them again,
+  and leaves out each later clip's first picture, which repeats the picture
+  before it. All clips of one job have the document's shape, so their tracks
+  match. The join and its change to the job run in one blocking piece
+  (`join_layer` in `queue.rs`), so a pause cannot leave the job between them.
 - Files the app keeps for itself (settings, job list) go through
   `src-tauri/src/crypto.rs`. Never write a layer's picture or an unfinished
   clip to the disk. Finished videos are plain WebM files by the user's choice.

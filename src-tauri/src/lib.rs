@@ -3,6 +3,7 @@ mod crypto;
 mod document;
 mod engine;
 mod files;
+mod last_frame;
 mod queue;
 mod settings;
 mod tray;
@@ -114,6 +115,7 @@ pub fn run() {
             queue::queue_pause,
             queue::queue_resume,
             queue::queue_clear,
+            queue::queue_clear_done,
             take_pending_open_document,
             hide_to_tray,
             quit_app,

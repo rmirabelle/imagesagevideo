@@ -8,11 +8,17 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::{
     crypto, document,
     engine::{self, Engine, Step, VIDEO_STEPS},
-    settings, tray, webm,
+    last_frame, settings, tray, webm,
 };
 
 /**
- * The job: one document, and three 5-second clips for each chosen layer.
+ * The job: one document, and one video for each chosen layer. The user
+ * chooses how many 5-second clips a video has. The first clip starts from
+ * the layer's picture. Each clip after it starts from the last picture of
+ * the clip before, with the same prompt, so the clips continue one another.
+ * When a layer's clips are all done, they are joined into the layer's video
+ * and the clips are deleted.
+ *
  * The job runs in the Rust side of the app, so it goes on while the window
  * is hidden in the tray. The clips are made one after the other, bottom
  * layer first.
@@ -24,9 +30,10 @@ use crate::{
  * The job list is kept in an encrypted file after each change, so a job
  * that was not finished when the app closed can go on later. A clip is in
  * memory until it is finished; then it is written to the output folder as
- * a normal WebM file.
+ * a normal WebM file, and the next clip reads its last picture from there.
  */
-pub const CLIPS_PER_LAYER: usize = 3;
+pub const DEFAULT_CLIPS_PER_LAYER: usize = 2;
+pub const MAX_CLIPS_PER_LAYER: usize = 20;
 /// After this many clips fail one after the other, the job pauses; the cause is then not one bad clip.
 const MAX_FAILURES_IN_A_ROW: u32 = 2;
 
@@ -46,6 +53,9 @@ pub struct Clip {
     /// The finished clip's file.
     file: Option<String>,
     error: Option<String>,
+    /// The user removed this finished clip from the list. It stays in the layer's video.
+    #[serde(default)]
+    cleared: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -57,6 +67,15 @@ pub struct LayerJob {
     name: String,
     prompt: String,
     clips: Vec<Clip>,
+    /// The layer's video: its clips, joined. The clips' own files are deleted when it is made.
+    #[serde(default)]
+    video: Option<String>,
+}
+
+impl LayerJob {
+    fn all_done(&self) -> bool {
+        self.clips.iter().all(|clip| clip.status == ClipStatus::Done)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -64,13 +83,9 @@ pub struct LayerJob {
 pub struct Job {
     document: String,
     output_dir: String,
-    /// Also make one video of all the clips, joined.
-    combine: bool,
     clip_width: u32,
     clip_height: u32,
     layers: Vec<LayerJob>,
-    /// The combined video's file, once it is made.
-    combined: Option<String>,
 }
 
 impl Job {
@@ -80,23 +95,35 @@ impl Job {
         })
     }
 
+    /// The clips that are in the list: those the user did not remove.
+    fn listed(&self) -> impl Iterator<Item = &Clip> {
+        self.layers.iter().flat_map(|layer| &layer.clips).filter(|clip| !clip.cleared)
+    }
+
     fn count(&self, status: ClipStatus) -> usize {
-        self.layers.iter().flat_map(|layer| &layer.clips).filter(|clip| clip.status == status).count()
+        self.listed().filter(|clip| clip.status == status).count()
     }
 
     fn total(&self) -> usize {
-        self.layers.iter().map(|layer| layer.clips.len()).sum()
+        self.listed().count()
     }
 
-    /// The finished clips' files, in the order of the combined video: bottom layer first.
-    fn finished_files(&self) -> Vec<String> {
-        self.layers
-            .iter()
-            .flat_map(|layer| &layer.clips)
-            .filter(|clip| clip.status == ClipStatus::Done)
-            .filter_map(|clip| clip.file.clone())
-            .collect()
+    /**
+     * Removes each done clip from the list. The clip stays in the job, so
+     * the places of the other clips do not change and the layer's video
+     * still has it. Returns how many clips it removed.
+     */
+    fn clear_done(&mut self) -> usize {
+        let mut removed = 0;
+        for clip in self.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
+            if clip.status == ClipStatus::Done && !clip.cleared {
+                clip.cleared = true;
+                removed += 1;
+            }
+        }
+        removed
     }
+
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
@@ -128,7 +155,7 @@ pub struct Snapshot {
     job: Option<Job>,
     state: RunState,
     current: Option<Current>,
-    /// Why the job paused by itself, or why the combined video could not be made.
+    /// Why the job paused by itself, or why a layer's video could not be made.
     error: Option<String>,
     clips_done: usize,
     clips_failed: usize,
@@ -278,8 +305,9 @@ fn document_stem(document: &str) -> String {
 pub struct StartRequest {
     document: String,
     output_dir: String,
-    combine: bool,
-    /// The layers to make clips of, by their file in the document.
+    /// How many 5-second clips each layer's video has.
+    clips: usize,
+    /// The layers to make a video of, by their file in the document.
     tiles: Vec<String>,
 }
 
@@ -312,6 +340,7 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
     })
     .await
     .map_err(|error| format!("Reading the document stopped unexpectedly: {error}"))??;
+    let clips = request.clips.clamp(1, MAX_CLIPS_PER_LAYER);
     let jobs: Vec<LayerJob> = layers
         .into_iter()
         .enumerate()
@@ -321,7 +350,8 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
             tile: layer.tile,
             name: layer.name,
             prompt: layer.prompt,
-            clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None }; CLIPS_PER_LAYER],
+            clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
+            video: None,
         })
         .collect();
     if jobs.is_empty() {
@@ -330,15 +360,13 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
     let job = Job {
         document: crate::files::windows_path(&request.document),
         output_dir: output.to_string_lossy().into_owned(),
-        combine: request.combine,
         clip_width: size.0,
         clip_height: size.1,
         layers: jobs,
-        combined: None,
     };
     let mut saved = settings::load(&app);
     saved.output_dir = job.output_dir.clone();
-    saved.combine = job.combine;
+    saved.clips_per_layer = clips;
     settings::save(&app, &saved)?;
     let mut inner = queue.lock();
     if inner.state == RunState::Running {
@@ -396,7 +424,7 @@ pub fn resume(app: &AppHandle, queue: &Queue, engine: &Engine) {
     let Some(job) = inner.job.as_mut() else { return };
     for clip in job.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
         if clip.status == ClipStatus::Failed {
-            *clip = Clip { status: ClipStatus::Pending, file: None, error: None };
+            *clip = Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false };
         }
     }
     spawn_runner(app, queue, engine, &mut inner);
@@ -429,6 +457,30 @@ pub fn queue_clear(app: AppHandle, queue: State<'_, Queue>) -> Result<(), String
     Ok(())
 }
 
+/**
+ * Removes the done clips from the list; the job can be running. The
+ * videos stay in their folder. The runner goes on: the clips keep their
+ * places in the job, so the generation does not change. When no clip is
+ * left in a job that does not run, the job itself is removed.
+ */
+#[tauri::command]
+pub fn queue_clear_done(app: AppHandle, queue: State<'_, Queue>) {
+    let mut inner = queue.lock();
+    let Some(job) = inner.job.as_mut() else { return };
+    if job.clear_done() == 0 {
+        return;
+    }
+    if job.listed().next().is_none() && inner.state != RunState::Running {
+        inner.generation += 1;
+        inner.job = None;
+        inner.state = RunState::Idle;
+        inner.current = None;
+        inner.error = None;
+    }
+    save_job(&app, inner.job.as_ref());
+    publish(&app, &inner);
+}
+
 /// Changes the job as the runner with this generation. None when that runner was paused or replaced; it must then stop.
 fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change: impl FnOnce(&mut Inner) -> T) -> Option<T> {
     let mut inner = queue.lock();
@@ -443,7 +495,7 @@ fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change
     Some(result)
 }
 
-/// Makes the job's clips, one after the other, then the combined video.
+/// Makes the job's clips, one after the other. When a layer's clips are all done, it joins them into the layer's video.
 async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
     let mut picture: Option<(usize, String)> = None;
     let mut failures_in_a_row = 0_u32;
@@ -463,10 +515,18 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
         let stop = failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
         let updated = update(&app, &queue, generation, true, |inner| {
             let Some(job) = inner.job.as_mut() else { return };
-            job.layers[layer].clips[clip] = match &made {
-                Ok(file) => Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None },
-                Err(error) => Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()) },
-            };
+            let clips = &mut job.layers[layer].clips;
+            match &made {
+                Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false },
+                Err(error) => {
+                    clips[clip] = Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()), cleared: false };
+                    /* The clips after it have no picture to start from. Retry makes them again, in order. */
+                    for later in clips[clip + 1..].iter_mut().filter(|later| later.status == ClipStatus::Pending) {
+                        later.status = ClipStatus::Failed;
+                        later.error = Some("The clip before this one failed, so this clip was not made.".into());
+                    }
+                }
+            }
             if stop {
                 inner.state = RunState::Paused;
                 inner.current = None;
@@ -482,51 +542,94 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
             engine.stop();
             return;
         }
+        if made.is_ok() && join_layer(&app, &queue, generation, layer).await.is_none() {
+            return;
+        }
     }
     /* Every clip is done or failed: the engine ends, so the model leaves the GPU memory. */
     engine.stop();
-    let combine = update(&app, &queue, generation, false, |inner| {
-        let job = inner.job.as_ref()?;
-        let files = job.finished_files();
-        if !job.combine || files.is_empty() {
-            return None;
+    /* A job from before the app closed can have a layer whose clips are done but not joined. */
+    let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
+    for layer in 0..layers {
+        if join_layer(&app, &queue, generation, layer).await.is_none() {
+            return;
         }
-        inner.current = Some(Current { layer: 0, clip: 0, stage: "joining", progress: 0.0 });
-        let target = job.combined.clone().map(PathBuf::from).unwrap_or_else(|| unused_path(Path::new(&job.output_dir), &format!("{}-combined", document_stem(&job.document))));
-        Some((files, target))
-    });
-    let Some(combine) = combine else { return };
-    let joined = match combine {
-        Some((files, target)) => Some(
-            tauri::async_runtime::spawn_blocking(move || join_files(&files, &target))
-                .await
-                .unwrap_or_else(|error| Err(format!("Joining the clips stopped unexpectedly: {error}"))),
-        ),
-        None => None,
-    };
+    }
     update(&app, &queue, generation, true, |inner| {
-        match joined {
-            Some(Ok(file)) => {
-                if let Some(job) = inner.job.as_mut() {
-                    job.combined = Some(file);
-                }
-            }
-            Some(Err(error)) => inner.error = Some(format!("The combined video was not made. {error}")),
-            None => {}
-        }
         inner.state = RunState::Finished;
         inner.current = None;
         inner.task = None;
     });
 }
 
-/// Reads the finished clips and writes them, joined, to `target`.
+/**
+ * When the layer's clips are all done, joins them into the layer's video
+ * and deletes the clips. Returns None when this runner was paused or
+ * replaced; it must then stop.
+ *
+ * The join and the change to the job run in one piece that a pause cannot
+ * cut in two. If the job was paused during the join, the new video is
+ * removed and the clips stay, so Resume joins them again.
+ */
+async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, layer: usize) -> Option<()> {
+    let work = update(app, queue, generation, false, |inner| {
+        let job = inner.job.as_ref()?;
+        let layer_job = job.layers.get(layer)?;
+        if layer_job.video.is_some() || !layer_job.all_done() {
+            return None;
+        }
+        let files: Vec<String> = layer_job.clips.iter().filter_map(|clip| clip.file.clone()).collect();
+        if files.len() != layer_job.clips.len() {
+            return None;
+        }
+        let name = format!("{}-{:02}-{}", document_stem(&job.document), layer_job.index + 1, slug(&layer_job.name));
+        let target = unused_path(Path::new(&job.output_dir), &name);
+        inner.current = Some(Current { layer, clip: 0, stage: "joining", progress: 0.0 });
+        Some((files, target, layer_job.name.clone()))
+    })?;
+    let Some((files, target, name)) = work else { return Some(()) };
+    let (app, queue) = (app.clone(), queue.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let joined = join_files(&files, &target);
+        let kept = update(&app, &queue, generation, true, |inner| {
+            inner.current = None;
+            match &joined {
+                Ok(file) => {
+                    if let Some(layer_job) = inner.job.as_mut().and_then(|job| job.layers.get_mut(layer)) {
+                        layer_job.video = Some(file.clone());
+                        for clip in &mut layer_job.clips {
+                            clip.file = None;
+                        }
+                    }
+                }
+                Err(error) => inner.error = Some(format!("The video of the layer \"{name}\" was not made. {error}")),
+            }
+        });
+        match (kept, joined) {
+            (Some(()), Ok(_)) => {
+                for file in &files {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+            (None, Ok(file)) => {
+                let _ = std::fs::remove_file(file);
+            }
+            _ => {}
+        }
+        kept
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Reads a layer's clips and writes them, joined, to `target`. Each clip continues the clip before it.
 fn join_files(files: &[String], target: &Path) -> Result<String, String> {
     let clips = files
         .iter()
         .map(|file| std::fs::read(file).map_err(|error| format!("Could not read {file}: {error}")))
         .collect::<Result<Vec<_>, _>>()?;
-    let joined = webm::join(&clips)?;
+    let joined = webm::join(&clips, true)?;
     std::fs::write(target, joined).map_err(|error| format!("Could not save {}: {error}", target.display()))?;
     Ok(target.to_string_lossy().into_owned())
 }
@@ -544,28 +647,42 @@ async fn make_one(
     picture: &mut Option<(usize, String)>,
 ) -> Result<String, String> {
     let layer_job = &job.layers[layer];
-    /* The three clips of a layer start from the same picture, so it is made once. */
-    if picture.as_ref().is_none_or(|(made_for, _)| *made_for != layer) {
-        let (document, index, size) = (job.document.clone(), layer_job.index, (job.clip_width, job.clip_height));
-        let data_url = tauri::async_runtime::spawn_blocking(move || {
-            let layers = document::read_layers(Path::new(&document))?;
-            if index >= layers.len() {
-                return Err("The document changed and no longer has this layer.".to_string());
-            }
-            document::layer_start_picture(Path::new(&document), &layers, index, size.0, size.1)
+    let size = (job.clip_width, job.clip_height);
+    let continued;
+    let image = if clip == 0 {
+        /* The first clip starts from the layer's picture. It is kept, so Retry does not make it again. */
+        if picture.as_ref().is_none_or(|(made_for, _)| *made_for != layer) {
+            let (document, index) = (job.document.clone(), layer_job.index);
+            let data_url = tauri::async_runtime::spawn_blocking(move || {
+                let layers = document::read_layers(Path::new(&document))?;
+                if index >= layers.len() {
+                    return Err("The document changed and no longer has this layer.".to_string());
+                }
+                document::layer_start_picture(Path::new(&document), &layers, index, size.0, size.1)
+            })
+            .await
+            .map_err(|error| format!("Reading the layer stopped unexpectedly: {error}"))??;
+            *picture = Some((layer, data_url));
+        }
+        picture.as_ref().map(|(_, data_url)| data_url.as_str()).unwrap_or_default()
+    } else {
+        /* Each clip after the first starts from the last picture of the clip before it. */
+        let before = layer_job.clips[clip - 1].file.clone().ok_or("The clip before this one has no file, so this clip cannot continue it.")?;
+        continued = tauri::async_runtime::spawn_blocking(move || {
+            let bytes = std::fs::read(&before).map_err(|error| format!("Could not read {before}: {error}"))?;
+            last_frame::start_picture(&bytes, size.0, size.1)
         })
         .await
-        .map_err(|error| format!("Reading the layer stopped unexpectedly: {error}"))??;
-        *picture = Some((layer, data_url));
-    }
-    let image = picture.as_ref().map(|(_, data_url)| data_url.as_str()).unwrap_or_default();
+        .map_err(|error| format!("Reading the clip before this one stopped unexpectedly: {error}"))??;
+        continued.as_str()
+    };
     let files = settings::load(app).files;
     let report = |stage: &'static str, progress: f64| {
         update(app, queue, generation, false, |inner| {
             inner.current = Some(Current { layer, clip, stage, progress });
         });
     };
-    let bytes = engine::make_clip(app, engine, &files, &layer_job.prompt, (job.clip_width, job.clip_height), image, |step| match step {
+    let bytes = engine::make_clip(app, engine, &files, &layer_job.prompt, size, image, |step| match step {
         Step::Loading => report("loading", 0.0),
         Step::Sampling { step, preview } => {
             report("generating", step as f64 / f64::from(VIDEO_STEPS));
@@ -590,7 +707,6 @@ mod tests {
         Job {
             document: r"D:\Art\My Fox (final).imagesage".into(),
             output_dir: r"D:\Out".into(),
-            combine: true,
             clip_width: 832,
             clip_height: 464,
             layers: statuses
@@ -604,12 +720,25 @@ mod tests {
                     clips: clips
                         .iter()
                         .enumerate()
-                        .map(|(clip, &status)| Clip { status, file: (status == ClipStatus::Done).then(|| format!("{index}-{clip}.webm")), error: None })
+                        .map(|(clip, &status)| Clip { status, file: (status == ClipStatus::Done).then(|| format!("{index}-{clip}.webm")), error: None, cleared: false })
                         .collect(),
+                    video: None,
                 })
                 .collect(),
-            combined: None,
         }
+    }
+
+    #[test]
+    fn clearing_removes_only_the_done_clips_from_the_list() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Done, Done], [Done, Failed, Done], [Done, Running, Pending]]);
+        assert_eq!(job.clear_done(), 6);
+        assert_eq!(job.clear_done(), 0);
+        assert_eq!((job.count(Done), job.count(Failed), job.total()), (0, 1, 3));
+        /* The runner's places do not change, and the clips keep their files for the layer's video. */
+        assert_eq!(job.next_pending(), Some((2, 2)));
+        assert_eq!(job.layers.iter().flat_map(|layer| &layer.clips).filter(|clip| clip.file.is_some()).count(), 6);
+        assert!(job.layers[0].all_done() && !job.layers[1].all_done());
     }
 
     #[test]
@@ -618,7 +747,6 @@ mod tests {
         let two_layers = job(&[[Done, Failed, Done], [Done, Pending, Pending]]);
         assert_eq!(two_layers.next_pending(), Some((1, 1)));
         assert_eq!((two_layers.count(Done), two_layers.count(Failed), two_layers.total()), (3, 1, 6));
-        assert_eq!(two_layers.finished_files(), vec!["0-0.webm", "0-2.webm", "1-0.webm"]);
         assert_eq!(job(&[[Done, Done, Failed]]).next_pending(), None);
     }
 

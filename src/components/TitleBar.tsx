@@ -24,6 +24,7 @@ export function TitleBar({ updateAvailable, onAbout, onSettings }: Props) {
       <div className="brand" data-tauri-drag-region>
         <img src="/icon.ico" alt="" />
         <span>Image Sage Video</span>
+        {import.meta.env.DEV && <span className="brand-dev">DEV</span>}
       </div>
       {updateAvailable && (
         <button className="titlebar-update-button" onClick={onAbout} title="A new Image Sage Video version is available">

@@ -80,8 +80,9 @@ when there is one. If not, it unpacks its own copy into
 `%LOCALAPPDATA%\com.robmirabelle.imagesagevideo\engines\<build>`.
 
 To move to a newer build, change Image Sage first, then copy `ENGINE_BUILD`
-and `ENGINE_ZIPS` here, and before release make one layer's three clips and a
-combined video. The model files are the user's own; the app never downloads
+and `ENGINE_ZIPS` here, and before release make one layer's video of two clips
+or more. That test also shows that the engine's clips are still VP8 key
+pictures, which `last_frame.rs` needs. The model files are the user's own; the app never downloads
 them.
 
 ## Windows PowerShell 5.1 note

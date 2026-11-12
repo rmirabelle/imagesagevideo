@@ -19,13 +19,13 @@ pub struct Settings {
     pub files: ModelFiles,
     /// The folder the last job saved its videos in.
     pub output_dir: String,
-    /// The last job also made one combined video.
-    pub combine: bool,
+    /// How many 5-second clips each layer's video had in the last job.
+    pub clips_per_layer: usize,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { files: ModelFiles::default(), output_dir: String::new(), combine: true }
+        Self { files: ModelFiles::default(), output_dir: String::new(), clips_per_layer: crate::queue::DEFAULT_CLIPS_PER_LAYER }
     }
 }
 

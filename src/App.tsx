@@ -10,6 +10,7 @@ import {
   Pause,
   Play,
   Plus,
+  Trash,
   WarningCircle
 } from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -22,6 +23,7 @@ import {
   openDocument,
   playVideo,
   queueClear,
+  queueClearDone,
   queueGet,
   queuePause,
   queueResume,
@@ -37,7 +39,8 @@ import {
 } from "./lib/api";
 import { checkForUpdate, getAppVersion, type UpdateInfo } from "./lib/updater";
 
-const CLIPS_PER_LAYER = 3;
+const CLIP_SECONDS = 5;
+const MAX_CLIPS_PER_LAYER = 20;
 const EMPTY: Snapshot = { job: null, state: "idle", current: null, error: null, clipsDone: 0, clipsFailed: 0, clipsTotal: 0 };
 
 const STAGE_TEXT: Record<Current["stage"], string> = {
@@ -51,7 +54,7 @@ const STAGE_TEXT: Record<Current["stage"], string> = {
 /**
  * The one window of Image Sage Video. Before a job, it shows the opened
  * document's layers with a checkbox for each. During a job, it shows the
- * three clips of each layer and their progress. The job itself runs in the
+ * clips of each layer and their progress, then each layer's video. The job itself runs in the
  * Rust side, so it goes on while this window is hidden in the tray.
  */
 export default function App() {
@@ -66,7 +69,7 @@ export default function App() {
   const [opening, setOpening] = useState(false);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [outputDir, setOutputDir] = useState("");
-  const [combine, setCombine] = useState(true);
+  const [clipsPerLayer, setClipsPerLayer] = useState(2);
   const [missing, setMissing] = useState<string[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
@@ -101,7 +104,7 @@ export default function App() {
     void checkForUpdate().then(setUpdateInfo).catch(() => { /* No network: the About dialog can check again. */ });
     void refreshSettings().then((view) => {
       setOutputDir(view.settings.outputDir);
-      setCombine(view.settings.combine);
+      setClipsPerLayer(view.settings.clipsPerLayer || 2);
     });
     void (async () => {
       const saved = await queueGet();
@@ -147,7 +150,7 @@ export default function App() {
     if (!info) return;
     setMessage(null);
     try {
-      await queueStart({ document: info.path, outputDir, combine, tiles: [...chosen] });
+      await queueStart({ document: info.path, outputDir, clips: clipsPerLayer, tiles: [...chosen] });
     } catch (error) {
       setMessage(String(error));
     }
@@ -159,6 +162,20 @@ export default function App() {
       setPreview(null);
       setMessage(null);
       if (info) setChosen(new Set(info.layers.map((layer) => layer.tile)));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  /* When no clip is left, the job is gone. The document then closes too, so the list is empty and does not show the layers again. */
+  const clearDone = async () => {
+    try {
+      await queueClearDone();
+      if ((await queueGet()).job) return;
+      setInfo(null);
+      setChosen(new Set());
+      setPreview(null);
+      setMessage(null);
     } catch (error) {
       setMessage(String(error));
     }
@@ -176,9 +193,13 @@ export default function App() {
 
   /* The rows: during a job, the job's layers; before it, the document's layers. Both lists have the bottom layer first; the list shows the top layer first, as Image Sage does. */
   const rows = job
-    ? job.layers.map((layer) => ({ tile: layer.tile, number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips as Clip[] | null }))
-    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: layer.prompt, clips: null as Clip[] | null }));
+    ? job.layers.filter((layer) => layer.clips.some((clip) => !clip.cleared)).map((layer) => ({ tile: layer.tile, number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips as Clip[] | null, video: layer.video }))
+    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: layer.prompt, clips: null as Clip[] | null, video: null as string | null }));
   const shownRows = [...rows].reverse();
+  /* The clips in the list. While the clips are joined, all of them are done and the list must not become empty. */
+  const listedClips = rows.flatMap((row) => row.clips ?? []).filter((clip) => !clip.cleared);
+  const doneClips = listedClips.filter((clip) => clip.status === "done").length;
+  const canClearDone = doneClips > 0 && !(running && doneClips === listedClips.length);
 
   const clipSize = job ? `${job.clipWidth} × ${job.clipHeight}` : info?.clipWidth ? `${info.clipWidth} × ${info.clipHeight}` : null;
   const overall = snapshot.clipsTotal
@@ -190,7 +211,7 @@ export default function App() {
     : missing.length ? `Choose the Wan 2.2 ${missing.join(", ")} in Settings.`
     : !outputDir.trim() ? "Choose the folder for the videos."
     : chosen.size === 0 ? "Choose one layer or more."
-    : `Make ${chosen.size * CLIPS_PER_LAYER} clips: ${CLIPS_PER_LAYER} for each of ${chosen.size} layers.`;
+    : `Make ${chosen.size} ${chosen.size === 1 ? "video" : "videos"} of ${clipsPerLayer * CLIP_SECONDS} seconds: ${clipsPerLayer} ${clipsPerLayer === 1 ? "clip" : "clips"} for each layer.`;
 
   const statusText = !job ? startHint
     : snapshot.state === "running" && snapshot.current
@@ -229,10 +250,21 @@ export default function App() {
             <button className="button secondary" onClick={() => void chooseOutput()}><FolderOpen size={15} /> Choose…</button>
           )}
         </div>
-        <label className="setup-check" title="After the last clip, all the clips are joined in order into one video, with no fade between them">
-          <input type="checkbox" checked={job ? job.combine : combine} disabled={!!job} onChange={(event) => setCombine(event.target.checked)} />
-          Also make one combined video of all the clips
-        </label>
+        <div className="setup-row">
+          <label className="setup-label" htmlFor="clips-per-layer">Clips per layer</label>
+          <div className="setup-clips" title="Each clip is 5 seconds. The first clip starts from the layer's picture. Each clip after it starts from the last picture of the clip before. The clips are then joined into one video, and the clips are deleted.">
+            <input
+              id="clips-per-layer"
+              type="number"
+              min={1}
+              max={MAX_CLIPS_PER_LAYER}
+              value={job ? (job.layers[0]?.clips.length ?? clipsPerLayer) : clipsPerLayer}
+              disabled={!!job}
+              onChange={(event) => setClipsPerLayer(Math.min(MAX_CLIPS_PER_LAYER, Math.max(1, Math.round(Number(event.target.value)) || 1)))}
+            />
+            <span>= one video of {(job ? (job.layers[0]?.clips.length ?? clipsPerLayer) : clipsPerLayer) * CLIP_SECONDS} seconds for each layer</span>
+          </div>
+        </div>
       </section>
 
       {!job && missing.length > 0 && (
@@ -257,7 +289,7 @@ export default function App() {
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
                 <p>Open an Image Sage document.</p>
-                <span>Each layer becomes three 5-second Wan 2.2 clips. Each clip starts from the layer's picture and follows the layer's prompt.</span>
+                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt.</span>
               </div>
             )}
             {shownRows.map((row) => {
@@ -273,9 +305,20 @@ export default function App() {
                     </div>
                     <div className="layer-prompt" title={row.prompt}>{row.prompt || "No prompt: Wan 2.2 chooses the motion."}</div>
                   </div>
-                  {row.clips && (
+                  {row.video && (
                     <div className="clips">
-                      {row.clips.map((clip, index) => (
+                      <button
+                        className="clip done video"
+                        title={`Play ${baseName(row.video)}`}
+                        onClick={(event) => { event.stopPropagation(); void playVideo(row.video!).catch((error) => setMessage(String(error))); }}
+                      >
+                        <Play size={11} weight="fill" /> {(row.clips?.length ?? 0) * CLIP_SECONDS} s
+                      </button>
+                    </div>
+                  )}
+                  {row.clips && !row.video && (
+                    <div className="clips">
+                      {row.clips.map((clip, index) => !clip.cleared && (
                         <ClipChip
                           key={index}
                           number={index + 1}
@@ -302,11 +345,6 @@ export default function App() {
                 ? snapshot.current.stage === "joining" ? "Joining the clips" : `${job.layers[snapshot.current.layer]?.name ?? ""} — clip ${snapshot.current.clip + 1}`
                 : snapshot.state === "paused" ? "Paused" : "Finished"}
             </div>
-            {job.combined && (
-              <button className="button secondary" onClick={() => void playVideo(job.combined!).catch((error) => setMessage(String(error)))} title={job.combined}>
-                <Play size={15} weight="fill" /> Play the Combined Video
-              </button>
-            )}
           </aside>
         )}
       </main>
@@ -349,6 +387,18 @@ export default function App() {
               <Play size={16} weight="fill" /> Retry Failed Clips
             </button>
           )}
+          {job && (
+            <button
+              className="button secondary large"
+              onClick={() => void clearDone()}
+              disabled={!canClearDone}
+              title={canClearDone
+                ? "Remove the finished clips and videos from the list. The videos stay in the folder."
+                : doneClips > 0 ? "Wait until the clips are joined." : "No clip is finished yet."}
+            >
+              <Trash size={16} /> Clear Finished
+            </button>
+          )}
           {job && !running && (
             <button className={`button large ${snapshot.state === "finished" ? "primary" : "secondary"}`} onClick={() => void newJob()} title="Remove this job from the list. The finished videos stay in their folder.">
               <Plus size={16} weight="bold" /> New Job
@@ -378,7 +428,7 @@ export default function App() {
   );
 }
 
-/** One clip of a layer: waiting, in work with its progress, done (a click plays it), or failed (the tooltip gives the reason). */
+/** One clip of a layer: waiting, in work with its progress, done (a click plays it, while it has a file), or failed (the tooltip gives the reason). */
 function ClipChip({ number, clip, current, onError }: { number: number; clip: Clip; current: Current | null; onError: (message: string) => void }) {
   if (clip.status === "done" && clip.file) {
     const file = clip.file;
@@ -387,6 +437,9 @@ function ClipChip({ number, clip, current, onError }: { number: number; clip: Cl
         <Play size={11} weight="fill" /> {number}
       </button>
     );
+  }
+  if (clip.status === "done") {
+    return <span className="clip done joined" title="Done"><CheckCircle size={12} weight="fill" /> {number}</span>;
   }
   if (clip.status === "failed") {
     return <span className="clip failed" title={clip.error ?? "The clip failed"}><WarningCircle size={12} weight="fill" /> {number}</span>;
