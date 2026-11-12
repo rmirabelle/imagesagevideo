@@ -1,0 +1,21 @@
+node_modules
+dist
+*.local
+
+src-tauri/target
+src-tauri/gen
+
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+Thumbs.db
+*.log
+icon-pack.zip
+
+# Documents and videos saved in the project folder while testing
+*.imagesage
+*.webm
+
+# TypeScript build cache
+*.tsbuildinfo
