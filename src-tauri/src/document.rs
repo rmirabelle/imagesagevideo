@@ -89,7 +89,7 @@ fn layer_name(name: Option<&str>, prompt: &str, index: usize) -> String {
     }
 }
 
-/// The layers a manifest names, bottom layer first. Steps after `historyIndex` are undone, so they are not layers.
+/// The layers a manifest names, bottom layer first. `historyIndex` is only the layer that is selected in Image Sage, so every step is a layer.
 fn manifest_layers(manifest: &Value) -> Result<Vec<LayerRef>, String> {
     if manifest.get("format").and_then(Value::as_str) != Some(DOCUMENT_FORMAT) {
         return Err("This is not an Image Sage document".into());
@@ -120,14 +120,10 @@ fn manifest_layers(manifest: &Value) -> Result<Vec<LayerRef>, String> {
         add(base, Some("Original"), prompt, false)?;
     }
     let steps = manifest.get("history").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    let count = manifest
-        .get("historyIndex")
-        .and_then(Value::as_u64)
-        .map_or(steps.len(), |index| (index as usize).min(steps.len()));
-    if count > MAX_LAYERS {
+    if steps.len() > MAX_LAYERS {
         return Err("The Image Sage document has too many layers to open safely".into());
     }
-    for step in &steps[..count] {
+    for step in steps {
         let tile = step.get("layer").and_then(Value::as_str).ok_or_else(too_old)?;
         add(
             tile,
@@ -296,11 +292,11 @@ mod tests {
             "history": [
                 { "prompt": "", "layer": "history/0001-layer.png" },
                 { "prompt": "add a red hat\nwith a feather", "layer": "history/0002-layer.png", "hidden": true },
-                { "prompt": "undone", "layer": "history/0003-layer.png" }
+                { "prompt": "above the selected layer", "layer": "history/0003-layer.png" }
             ]
         });
         let layers = manifest_layers(&manifest).unwrap();
-        assert_eq!(layers.len(), 2);
+        assert_eq!(layers.len(), 3);
         assert_eq!((layers[0].name.as_str(), layers[0].prompt.as_str()), ("Original", ""));
         assert_eq!((layers[1].name.as_str(), layers[1].hidden), ("add a red hat", true));
     }
