@@ -40,13 +40,16 @@ export interface LayerJob {
   clips: Clip[];
   /** The layer's video: its clips, joined. The clips have no files of their own then. */
   video: string | null;
-}
-
-export interface Job {
+  /** The layer's document or photo. */
   document: string;
-  outputDir: string;
+  /** The size of this layer's clips. */
   clipWidth: number;
   clipHeight: number;
+}
+
+/** The job's layers can come from many documents and photos. */
+export interface Job {
+  outputDir: string;
   layers: LayerJob[];
 }
 
@@ -122,14 +125,15 @@ export const openDocument = (path: string) => invoke<DocumentInfo>("open_documen
 /** One layer's own picture, large, as a JPEG data URL. */
 export const layerPicture = (path: string, tile: string) => invoke<string>("layer_picture", { path, tile });
 export const queueGet =() => invoke<Snapshot>("queue_get");
-export const queueStart = (request: { document: string; outputDir: string; clips: number; tiles: string[]; prompts: Record<string, string> }) =>
+/** Starts a job, or adds layers to the job that exists. A null prompt means the file's own prompt. */
+export const queueStart = (request: { outputDir: string; clips: number; layers: { document: string; tile: string; prompt: string | null }[] }) =>
   invoke<void>("queue_start", { request });
 export const queuePause = () => invoke<void>("queue_pause");
 export const queueResume = () => invoke<void>("queue_resume");
 export const queueClear = () => invoke<void>("queue_clear");
 export const queueClearDone = () => invoke<void>("queue_clear_done");
-/** Changes a layer's prompt in the job. The clips of that layer that start after this use it. */
-export const queueSetPrompt = (tile: string, prompt: string) => invoke<void>("queue_set_prompt", { tile, prompt });
+/** Changes the prompt of a job's layer, by the layer's place in the job. The clips of that layer that start after this use it. */
+export const queueSetPrompt = (layer: number, prompt: string) => invoke<void>("queue_set_prompt", { layer, prompt });
 /** Stops the clip in work and removes it from its layer; the job goes on with the next clip. */
 export const queueCancelClip = () => invoke<void>("queue_cancel_clip");
 export const settingsGet =() => invoke<SettingsView>("settings_get");

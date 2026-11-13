@@ -58,11 +58,48 @@ const STAGE_TEXT: Record<Current["stage"], string> = {
   joining: "Joining the clips"
 };
 
+/** One name for a file, however its path is written. */
+const fileKey = (path: string) => path.replace(/\//g, "\\").toLowerCase();
+/** One name for a layer of a file. */
+const layerKey = (path: string, tile: string) => `${fileKey(path)}|${tile}`;
+
+/** One row of the list: a layer that waits for Start, or a layer of the job. */
+interface Row {
+  /** The row's name in the list: `s:` and the layer's key for a waiting layer, `j:` and the layer's place for a job layer. */
+  id: string;
+  key: string;
+  path: string;
+  tile: string;
+  /** The layer's place in the job; -1 for a layer that waits for Start. */
+  jobLayer: number;
+  number: number;
+  name: string;
+  prompt: string;
+  clips: Clip[] | null;
+  video: string | null;
+}
+
+/** The rows as the list shows them: the files in their order, and the top layer of each file first, as Image Sage does. */
+function topLayerFirst(rows: Row[]): Row[] {
+  const shown: Row[] = [];
+  let group: Row[] = [];
+  for (const row of rows) {
+    if (group.length && fileKey(group[0].path) !== fileKey(row.path)) {
+      shown.push(...group.reverse());
+      group = [];
+    }
+    group.push(row);
+  }
+  return [...shown, ...group.reverse()];
+}
+
 /**
- * The one window of Image Sage Video. Before a job, it shows the opened
- * document's layers with a checkbox for each. During a job, it shows the
- * clips of each layer and their progress, then each layer's video. The job itself runs in the
- * Rust side, so it goes on while this window is hidden in the tray.
+ * The one window of Image Sage Video. The user opens documents and photos;
+ * their layers wait in the list with a checkbox for each. Start makes a job
+ * of the chosen layers. While a job exists, the list also shows the job's
+ * layers with their clips and videos, and the user can open more files and
+ * add their layers to the job. The job itself runs in the Rust side, so it
+ * goes on while this window is hidden in the tray.
  */
 export default function App() {
   const [version, setVersion] = useState("");
@@ -72,18 +109,21 @@ export default function App() {
   const [closeAsked, setCloseAsked] = useState(false);
 
   const [snapshot, setSnapshot] = useState<Snapshot>(EMPTY);
-  const [info, setInfo] = useState<DocumentInfo | null>(null);
+  /* Each file the window read, by its file key. A job's files stay here for their small pictures. */
+  const [known, setKnown] = useState<Map<string, DocumentInfo>>(new Map());
+  /* The file keys of the files whose layers wait for Start, in the order the user opened them. */
+  const [staged, setStaged] = useState<string[]>([]);
   const [opening, setOpening] = useState(false);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
-  /* The layers the user removed from the list. The document does not change, and they come back when it is opened again. */
+  /* The layers the user removed from the list. The file does not change, and they come back when it is opened again. */
   const [removed, setRemoved] = useState<Set<string>>(new Set());
-  /* The prompts the user changed, by layer. The document does not change; the job gets these prompts. */
+  /* The prompts the user changed, by layer key. The file does not change; the job gets these prompts. */
   const [prompts, setPrompts] = useState<Map<string, string>>(new Map());
-  /* The layer whose prompt is in the text box now. */
+  /* The row whose prompt is in the text box now. */
   const [editing, setEditing] = useState<string | null>(null);
   const editCancelled = useRef(false);
-  /* The layer whose large picture shows. The small picture shows first, until the large one is read. */
-  const [zoom, setZoom] = useState<{ tile: string; name: string; src: string } | null>(null);
+  /* The row whose large picture shows. The small picture shows first, until the large one is read. */
+  const [zoom, setZoom] = useState<{ id: string; name: string; src: string } | null>(null);
   const [outputDir, setOutputDir] = useState("");
   const [clipsPerLayer, setClipsPerLayer] = useState(2);
   const [missing, setMissing] = useState<string[]>([]);
@@ -99,22 +139,42 @@ export default function App() {
     return view;
   }, []);
 
-  const loadDocument = useCallback(async (path: string, selectAll: boolean) => {
+  /**
+   * Reads files. With `stage`, their layers go into the list and wait for
+   * Start, all chosen. Without it, the files are only read for the small
+   * pictures of a job's layers, and a file that is gone is not an error.
+   */
+  const loadDocuments = useCallback(async (paths: string[], stage: boolean) => {
     setOpening(true);
-    setMessage(null);
-    try {
-      const opened = await openDocument(path);
-      setInfo(opened);
-      setRemoved(new Set());
-      setPrompts(new Map());
-      /* A photo has no prompt, so its text box opens at once. */
-      setEditing(selectAll && opened.layers.length === 1 && opened.layers[0].tile === PHOTO_TILE ? PHOTO_TILE : null);
-      if (selectAll) setChosen(new Set(opened.layers.map((layer) => layer.tile)));
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setOpening(false);
+    if (stage) setMessage(null);
+    const opened: DocumentInfo[] = [];
+    const errors: string[] = [];
+    for (const path of paths) {
+      try {
+        const info = await openDocument(path);
+        if (stage && !info.clipWidth) errors.push(`${baseName(path)} is wider or taller than 3:1; Wan 2.2 cannot make a clip of that shape.`);
+        else opened.push(info);
+      } catch (error) {
+        errors.push(`${baseName(path)}: ${String(error)}`);
+      }
     }
+    setKnown((current) => {
+      const next = new Map(current);
+      for (const info of opened) next.set(fileKey(info.path), info);
+      return next;
+    });
+    if (stage) {
+      const keys = opened.flatMap((info) => info.layers.map((layer) => layerKey(info.path, layer.tile)));
+      setStaged((current) => [...current, ...opened.map((info) => fileKey(info.path)).filter((file, index, all) => !current.includes(file) && all.indexOf(file) === index)]);
+      setChosen((current) => new Set([...current, ...keys]));
+      setRemoved((current) => new Set([...current].filter((key) => !keys.includes(key))));
+      /* One photo has no prompt, so its text box opens at once. */
+      const only = opened.length === 1 && opened[0].layers.length === 1 ? opened[0] : null;
+      if (only && only.layers[0].tile === PHOTO_TILE) setEditing(`s:${layerKey(only.path, PHOTO_TILE)}`);
+      if (errors.length) setMessage(errors.join(" "));
+    }
+    setOpening(false);
+    return opened;
   }, []);
 
   /* Start: the version, an update check, the saved settings, and a job that was not finished when the app closed. */
@@ -130,10 +190,10 @@ export default function App() {
       const saved = await queueGet();
       setSnapshot(saved);
       const requested = await takePendingOpenDocument();
-      if (saved.job) await loadDocument(saved.job.document, false);
-      else if (requested) await loadDocument(requested, true);
+      if (saved.job) await loadDocuments([...new Set(saved.job.layers.map((layer) => layer.document))], false);
+      if (requested) await loadDocuments([requested], true);
     })();
-  }, [loadDocument, refreshSettings]);
+  }, [loadDocuments, refreshSettings]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -141,28 +201,24 @@ export default function App() {
       listen<Snapshot>("queue-changed", (event) => setSnapshot(event.payload)),
       listen<string>("clip-preview", (event) => setPreview(event.payload)),
       listen("close-requested", () => setCloseAsked(true)),
-      listen<string>("open-document-requested", (event) => {
-        void queueGet().then((now) => {
-          if (now.job) setMessage("Finish the job, or choose New Job, before you open another document.");
-          else void loadDocument(event.payload, true);
-        });
-      })
+      listen<string>("open-document-requested", (event) => void loadDocuments([event.payload], true))
     ];
     return () => { for (const stop of stops) void stop.then((unlisten) => unlisten()); };
-  }, [loadDocument]);
+  }, [loadDocuments]);
 
   /* The picture of the clip in work goes away when that clip ends. */
   useEffect(() => {
     if (!snapshot.current || snapshot.current.stage === "preparing" || snapshot.current.stage === "loading") setPreview(null);
   }, [snapshot.current?.layer, snapshot.current?.clip, snapshot.current?.stage]);
 
-  const chooseDocument = async () => {
-    const picked = await open({ multiple: false, filters: [
+  const chooseDocuments = async () => {
+    const picked = await open({ multiple: true, title: "Open Image Sage documents and photos", filters: [
       { name: "Image Sage documents and photos", extensions: ["imagesage", "png", "jpg", "jpeg", "webp"] },
       { name: "Image Sage documents", extensions: ["imagesage"] },
       { name: "Photos", extensions: ["png", "jpg", "jpeg", "webp"] }
     ] });
-    if (typeof picked === "string") await loadDocument(picked, true);
+    const paths = typeof picked === "string" ? [picked] : picked ?? [];
+    if (paths.length) await loadDocuments(paths, true);
   };
 
   const chooseOutput = async () => {
@@ -170,43 +226,60 @@ export default function App() {
     if (typeof picked === "string") setOutputDir(picked);
   };
 
+  /* Takes files out of the list of files that wait, with all that the window keeps for their layers. */
+  const unstage = (files: Set<string>) => {
+    const stays = (key: string) => !files.has(key.slice(0, key.lastIndexOf("|")));
+    setStaged((current) => current.filter((file) => !files.has(file)));
+    setChosen((current) => new Set([...current].filter(stays)));
+    setRemoved((current) => new Set([...current].filter(stays)));
+    setPrompts((current) => new Map([...current].filter(([key]) => stays(key))));
+    setEditing(null);
+  };
+
+  /* Starts a job with the chosen layers, or adds them to the job that exists. Their files then leave the list of files that wait. */
   const start = async () => {
-    if (!info) return;
+    const sent = stagedRows.filter((row) => chosen.has(row.key));
+    if (!sent.length) return;
     setMessage(null);
     try {
-      await queueStart({ document: info.path, outputDir, clips: clipsPerLayer, tiles: [...chosen], prompts: Object.fromEntries(prompts) });
+      await queueStart({
+        outputDir,
+        clips: clipsPerLayer,
+        layers: sent.map((row) => ({ document: row.path, tile: row.tile, prompt: prompts.has(row.key) ? row.prompt : null }))
+      });
+      unstage(new Set(sent.map((row) => fileKey(row.path))));
     } catch (error) {
       setMessage(String(error));
     }
   };
 
+  /* Removes the job. Its files go back into the list with the job's prompts, so the user can change them and start again. */
   const newJob = async () => {
+    const layers = job?.layers ?? [];
     try {
       await queueClear();
       setPreview(null);
-      setMessage(null);
-      /* The job's prompts stay, so the user can change them again. This also brings them back after the app started again. */
-      if (job && info) {
-        const original = new Map(info.layers.map((layer) => [layer.tile, layer.prompt]));
-        setPrompts((current) => {
-          const next = new Map(current);
-          for (const layer of job.layers) if (original.has(layer.tile) && original.get(layer.tile) !== layer.prompt) next.set(layer.tile, layer.prompt);
-          return next;
-        });
-      }
-      if (info) setChosen(new Set(info.layers.filter((layer) => !removed.has(layer.tile)).map((layer) => layer.tile)));
+      const opened = await loadDocuments([...new Set(layers.map((layer) => layer.document))], true);
+      setPrompts((current) => {
+        const next = new Map(current);
+        for (const layer of layers) {
+          const original = opened.find((info) => fileKey(info.path) === fileKey(layer.document))?.layers.find((known) => known.tile === layer.tile)?.prompt;
+          if (original !== undefined && original !== layer.prompt) next.set(layerKey(layer.document, layer.tile), layer.prompt);
+        }
+        return next;
+      });
     } catch (error) {
       setMessage(String(error));
     }
   };
 
-  /* When no clip is left, the job is gone. The document then closes too, so the list is empty and does not show the layers again. */
-  const clearDone = async () => {
+  const clearDone = () => void queueClearDone().catch((error) => setMessage(String(error)));
+
+  /* Closes the files that wait, and removes a job that does not run. The files and the finished videos do not change. */
+  const clearDocuments = async () => {
     try {
-      await queueClearDone();
-      if ((await queueGet()).job) return;
-      setInfo(null);
-      setChosen(new Set());
+      if (job && !running) await queueClear();
+      unstage(new Set(staged));
       setPreview(null);
       setMessage(null);
     } catch (error) {
@@ -214,28 +287,18 @@ export default function App() {
     }
   };
 
-  /* Closes the document, and removes a job that does not run. The document's file and the finished videos do not change. */
-  const clearDocument = async () => {
-    try {
-      if (job) await queueClear();
-      setInfo(null);
-      setChosen(new Set());
-      setRemoved(new Set());
-      setPrompts(new Map());
-      setEditing(null);
-      setPreview(null);
-      setMessage(null);
-    } catch (error) {
-      setMessage(String(error));
-    }
-  };
+  const layerInfos = useMemo(() => {
+    const infos = new Map<string, DocumentInfo["layers"][number]>();
+    for (const info of known.values()) for (const layer of info.layers) infos.set(layerKey(info.path, layer.tile), layer);
+    return infos;
+  }, [known]);
 
-  const zoomLayer = (tile: string, name: string) => {
-    const small = thumbnails.get(tile);
-    if (!info || !small) return;
-    setZoom({ tile, name, src: small });
-    layerPicture(info.path, tile)
-      .then((src) => setZoom((current) => (current?.tile === tile ? { ...current, src } : current)))
+  const zoomLayer = (row: Row) => {
+    const small = layerInfos.get(row.key)?.thumbnail;
+    if (!small) return;
+    setZoom({ id: row.id, name: row.name, src: small });
+    layerPicture(row.path, row.tile)
+      .then((src) => setZoom((current) => (current?.id === row.id ? { ...current, src } : current)))
       .catch((error) => setMessage(String(error)));
   };
 
@@ -246,68 +309,74 @@ export default function App() {
     return () => window.removeEventListener("keydown", close);
   }, [zoom !== null]);
 
-  /* Keeps a changed prompt. A prompt that is the same as the document's prompt is not a change. */
-  const setPrompt = (tile: string, text: string) => {
-    const original = info?.layers.find((layer) => layer.tile === tile)?.prompt ?? "";
+  /* Keeps a changed prompt of a layer that waits. A prompt that is the same as the file's prompt is not a change. */
+  const setPrompt = (key: string, text: string) => {
+    const original = layerInfos.get(key)?.prompt ?? "";
     setPrompts((current) => {
       const next = new Map(current);
-      if (text.trim() === original) next.delete(tile);
-      else next.set(tile, text.trim());
+      if (text.trim() === original) next.delete(key);
+      else next.set(key, text.trim());
       return next;
     });
   };
 
-  /* Before a job, the window keeps the prompt. In a job, the job gets it at once. */
-  const keepPrompt = (tile: string, text: string) => {
-    if (!job) setPrompt(tile, text);
-    else if (text.trim() !== job.layers.find((layer) => layer.tile === tile)?.prompt) void queueSetPrompt(tile, text).catch((error) => setMessage(String(error)));
+  /* For a layer that waits, the window keeps the prompt. For a job's layer, the job gets it at once. */
+  const keepPrompt = (row: Row, text: string) => {
+    if (row.jobLayer < 0) setPrompt(row.key, text);
+    else if (text.trim() !== row.prompt) void queueSetPrompt(row.jobLayer, text).catch((error) => setMessage(String(error)));
   };
 
-  const toggle = (tile: string) => setChosen((current) => {
+  const toggle = (key: string) => setChosen((current) => {
     const next = new Set(current);
-    if (next.has(tile)) next.delete(tile);
-    else next.add(tile);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
     return next;
   });
 
-  const removeLayer = (tile: string) => {
-    setRemoved((current) => new Set(current).add(tile));
+  const removeLayer = (key: string) => {
+    setRemoved((current) => new Set(current).add(key));
     setChosen((current) => {
       const next = new Set(current);
-      next.delete(tile);
+      next.delete(key);
       return next;
     });
   };
 
-  const listedLayers = (info?.layers ?? []).filter((layer) => !removed.has(layer.tile));
+  /* The layers that wait for Start: each file's layers, bottom layer first. */
+  const stagedRows: Row[] = staged.flatMap((file) => {
+    const info = known.get(file);
+    return (info?.layers ?? []).map((layer, index) => {
+      const key = layerKey(info!.path, layer.tile);
+      return { id: `s:${key}`, key, path: info!.path, tile: layer.tile, jobLayer: -1, number: index + 1, name: layer.name, prompt: prompts.get(key) ?? layer.prompt, clips: null, video: null };
+    });
+  }).filter((row) => !removed.has(row.key));
+  /* The job's layers that have a clip in the list. */
+  const jobRows: Row[] = (job?.layers ?? []).map((layer, index) => ({
+    id: `j:${index}`, key: layerKey(layer.document, layer.tile), path: layer.document, tile: layer.tile, jobLayer: index,
+    number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips, video: layer.video
+  })).filter((row) => row.clips.some((clip) => !clip.cleared));
+  /* The layers that wait are first, so the user sees the files that were opened last. */
+  const shownRows = [...topLayerFirst(stagedRows), ...topLayerFirst(jobRows)];
+  const manyFiles = new Set(shownRows.map((row) => fileKey(row.path))).size > 1;
+  const chosenCount = stagedRows.filter((row) => chosen.has(row.key)).length;
+  const hasRemoved = staged.length > 0 && removed.size > 0;
 
-  const thumbnails = useMemo(() => new Map(info?.layers.map((layer) => [layer.tile, layer.thumbnail]) ?? []), [info]);
-  const documentPrompts = useMemo(() => new Map(info?.layers.map((layer) => [layer.tile, layer.prompt]) ?? []), [info]);
-  const hiddenTiles = useMemo(() => new Set(info?.layers.filter((layer) => layer.hidden).map((layer) => layer.tile) ?? []), [info]);
-
-  /* The rows: during a job, the job's layers; before it, the document's layers. Both lists have the bottom layer first; the list shows the top layer first, as Image Sage does. */
-  const rows = job
-    ? job.layers.filter((layer) => layer.clips.some((clip) => !clip.cleared)).map((layer) => ({ tile: layer.tile, number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips as Clip[] | null, video: layer.video }))
-    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: prompts.get(layer.tile) ?? layer.prompt, clips: null as Clip[] | null, video: null as string | null })).filter((row) => !removed.has(row.tile));
-  const shownRows = [...rows].reverse();
   /* The clips in the list. While the clips are joined, all of them are done and the list must not become empty. */
-  const listedClips = rows.flatMap((row) => row.clips ?? []).filter((clip) => !clip.cleared);
+  const listedClips = jobRows.flatMap((row) => row.clips ?? []).filter((clip) => !clip.cleared);
   const doneClips = listedClips.filter((clip) => clip.status === "done").length;
   const canClearDone = doneClips > 0 && !(running && doneClips === listedClips.length);
 
-  /* A cancelled clip makes its layer shorter, so the job shows its longest layer. */
-  const shownClipsPerLayer = job ? Math.max(1, ...job.layers.map((layer) => layer.clips.length)) : clipsPerLayer;
-  const clipSize = job ? `${job.clipWidth} × ${job.clipHeight}` : info?.clipWidth ? `${info.clipWidth} × ${info.clipHeight}` : null;
+  const stagedInfos = staged.map((file) => known.get(file)).filter((info): info is DocumentInfo => !!info);
+  const jobFiles = new Set((job?.layers ?? []).map((layer) => fileKey(layer.document))).size;
   const overall = snapshot.clipsTotal
     ? (snapshot.clipsDone + snapshot.clipsFailed + (running && snapshot.current && snapshot.current.stage !== "joining" ? snapshot.current.progress : 0)) / snapshot.clipsTotal
     : 0;
-  const canStart = !!info && !!info.clipWidth && chosen.size > 0 && outputDir.trim() !== "" && missing.length === 0;
-  const startHint = !info ? "Open an Image Sage document or a photo first."
-    : !info.clipWidth ? "The document is wider or taller than 3:1; Wan 2.2 cannot make a clip of that shape."
+  const canStart = chosenCount > 0 && missing.length === 0 && (!!job || outputDir.trim() !== "");
+  const startHint = !stagedRows.length && !hasRemoved ? "Open Image Sage documents or photos first."
     : missing.length ? `Choose the Wan 2.2 ${missing.join(", ")} in Settings.`
     : !outputDir.trim() ? "Choose the folder for the videos."
-    : chosen.size === 0 ? "Choose one layer or more."
-    : `Make ${chosen.size} ${chosen.size === 1 ? "video" : "videos"} of ${clipsPerLayer * CLIP_SECONDS} seconds: ${clipsPerLayer} ${clipsPerLayer === 1 ? "clip" : "clips"} for each layer.`;
+    : chosenCount === 0 ? "Choose one layer or more."
+    : `Make ${chosenCount} ${chosenCount === 1 ? "video" : "videos"} of ${clipsPerLayer * CLIP_SECONDS} seconds: ${clipsPerLayer} ${clipsPerLayer === 1 ? "clip" : "clips"} for each layer.`;
 
   const statusText = !job ? startHint
     : snapshot.state === "running" && snapshot.current
@@ -318,29 +387,37 @@ export default function App() {
       ? `Paused. ${snapshot.clipsDone} of ${snapshot.clipsTotal} clips are done. The model is not in the GPU memory.`
     : `Finished. ${snapshot.clipsDone} of ${snapshot.clipsTotal} clips are done${snapshot.clipsFailed ? `, ${snapshot.clipsFailed} failed` : ""}.`;
 
+  /* The picture of the clip in work has the shape of that clip's layer. */
+  const previewLayer = job ? job.layers[snapshot.current?.layer ?? 0] ?? job.layers[0] : null;
+
   return (
     <div className="app-shell">
       <TitleBar updateAvailable={!!updateInfo} onAbout={() => setAboutOpen(true)} onSettings={() => setSettingsOpen(true)} />
 
       <section className="setup">
         <div className="setup-row">
-          <span className="setup-label">Document</span>
-          <div className="path-box" title={job?.document ?? info?.path ?? ""}>
-            {job ? baseName(job.document) : info ? baseName(info.path) : <em>No document is open</em>}
-            {info && <small>{info.width} × {info.height}{clipSize ? ` · clips ${clipSize}, 5 s` : ""}</small>}
+          <span className="setup-label">Files</span>
+          <div className="path-box" title={stagedInfos.map((info) => info.path).join("\n")}>
+            {stagedInfos.length === 1 ? baseName(stagedInfos[0].path)
+              : stagedInfos.length > 1 ? `${stagedInfos.length} files: ${stagedInfos.map((info) => baseName(info.path)).join(", ")}`
+              : job ? `${jobFiles} ${jobFiles === 1 ? "file is" : "files are"} in the job`
+              : <em>No document or photo is open</em>}
+            {stagedInfos.length === 1 && <small>{stagedInfos[0].width} × {stagedInfos[0].height} · clips {stagedInfos[0].clipWidth} × {stagedInfos[0].clipHeight}, 5 s</small>}
           </div>
           <div className="button-group">
-          <button className="button secondary" onClick={() => void chooseDocument()} disabled={!!job || opening} title={job ? "Choose New Job first" : "Open an Image Sage document or a photo"}>
-            {opening ? <CircleNotch className="spin" size={15} /> : <FolderOpen size={15} />} Open…
-          </button>
-          <button
-            className="button secondary"
-            onClick={() => void clearDocument()}
-            disabled={running || (!info && !job)}
-            title={running ? "Pause the job first" : job ? "Close the document and remove the job from the list. The finished videos stay in their folder." : "Close the document. The document's file does not change."}
-          >
-            <X size={15} /> Clear
-          </button>
+            <button className="button secondary" onClick={() => void chooseDocuments()} disabled={opening} title={job ? "Open more Image Sage documents or photos, to add them to the job" : "Open Image Sage documents or photos. You can choose many files."}>
+              {opening ? <CircleNotch className="spin" size={15} /> : <FolderOpen size={15} />} Open…
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void clearDocuments()}
+              disabled={staged.length === 0 && (!job || running)}
+              title={job && running ? "Close the files that are not in the job. The job goes on."
+                : job ? "Close the files and remove the job from the list. The finished videos stay in their folder."
+                : "Close the files. The files do not change."}
+            >
+              <X size={15} /> Clear
+            </button>
           </div>
         </div>
         <div className="setup-row">
@@ -358,22 +435,21 @@ export default function App() {
         </div>
         <div className="setup-row">
           <label className="setup-label" htmlFor="clips-per-layer">Clips per layer</label>
-          <div className="setup-clips" title="Each clip is 5 seconds. The first clip starts from the layer's picture. Each clip after it starts from the last picture of the clip before. The clips are then joined into one video, and the clips are deleted.">
+          <div className="setup-clips" title="Each clip is 5 seconds. The first clip starts from the layer's picture. Each clip after it starts from the last picture of the clip before. The clips are then joined into one video, and the clips are deleted. This number is for the layers that you start or add next.">
             <input
               id="clips-per-layer"
               type="number"
               min={1}
               max={MAX_CLIPS_PER_LAYER}
-              value={shownClipsPerLayer}
-              disabled={!!job}
+              value={clipsPerLayer}
               onChange={(event) => setClipsPerLayer(Math.min(MAX_CLIPS_PER_LAYER, Math.max(1, Math.round(Number(event.target.value)) || 1)))}
             />
-            <span>= one video of {(shownClipsPerLayer) * CLIP_SECONDS} seconds for each layer</span>
+            <span>= one video of {clipsPerLayer * CLIP_SECONDS} seconds for each layer{job ? " that you add" : ""}</span>
           </div>
         </div>
       </section>
 
-      {!job && missing.length > 0 && (
+      {missing.length > 0 && (!job || stagedRows.length > 0) && (
         <div className="banner">
           <WarningCircle size={16} weight="fill" />
           <span>Wan 2.2 is not set up: the {missing.join(", ")} {missing.length === 1 ? "is" : "are"} missing.</span>
@@ -383,42 +459,44 @@ export default function App() {
 
       <main className="workspace">
         <div className="layers">
-          {!job && info && (info.layers.length > 1 || removed.size > 0) && (
+          {(stagedRows.length > 1 || hasRemoved || (!!job && stagedRows.length > 0)) && (
             <div className="layers-toolbar">
-              <span>{chosen.size} of {listedLayers.length} layers</span>
-              {removed.size > 0 && <button className="link-button" onClick={() => setRemoved(new Set())} title="Show the layers that you removed from the list">Show removed ({removed.size})</button>}
-              <button className="link-button" onClick={() => setChosen(new Set(listedLayers.map((layer) => layer.tile)))}>All</button>
+              <span>{chosenCount} of {stagedRows.length} layers{job ? " to add to the job" : ""}</span>
+              {hasRemoved && <button className="link-button" onClick={() => setRemoved(new Set())} title="Show the layers that you removed from the list">Show removed ({removed.size})</button>}
+              <button className="link-button" onClick={() => setChosen(new Set(stagedRows.map((row) => row.key)))}>All</button>
               <button className="link-button" onClick={() => setChosen(new Set())}>None</button>
             </div>
           )}
           <div className="layers-list">
-            {shownRows.length === 0 && !(info && removed.size > 0) && (
+            {shownRows.length === 0 && !hasRemoved && (
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
-                <p>Open an Image Sage document or a photo.</p>
-                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here.</span>
+                <p>Open Image Sage documents or photos.</p>
+                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here. You can open more files while a job runs.</span>
               </div>
             )}
             {shownRows.map((row) => {
-              const jobLayer = job ? job.layers.findIndex((layer) => layer.tile === row.tile) : -1;
-              /* Before a job, each prompt can change. In a job, a prompt can change while the layer has a clip that did not start yet. */
-              const canEdit = !job || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
+              const waits = row.jobLayer < 0;
+              const info = layerInfos.get(row.key);
+              /* A layer that waits can always get a new prompt. A job's layer can get one while it has a clip that did not start yet. */
+              const canEdit = waits || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
               return (
-                <div className={`layer-row ${!job && !chosen.has(row.tile) ? "off" : ""}`} key={row.tile} onClick={() => !job && toggle(row.tile)}>
-                  {!job && <input type="checkbox" checked={chosen.has(row.tile)} onChange={() => toggle(row.tile)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
-                  {thumbnails.get(row.tile) ? (
-                    <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row.tile, row.name); }}>
-                      <img src={thumbnails.get(row.tile)} alt="" />
+                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`} key={row.id} onClick={() => waits && toggle(row.key)}>
+                  {waits && <input type="checkbox" checked={chosen.has(row.key)} onChange={() => toggle(row.key)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
+                  {info?.thumbnail ? (
+                    <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row); }}>
+                      <img src={info.thumbnail} alt="" />
                     </button>
                   ) : (
                     <div className="layer-thumb"><FilmStrip size={20} /></div>
                   )}
                   <div className="layer-text">
                     <div className="layer-name">
-                      <b>{row.number}</b> {row.name}
-                      {hiddenTiles.has(row.tile) && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
+                      {row.tile !== PHOTO_TILE && <b>{row.number}</b>} {row.name}
+                      {info?.hidden && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
+                      {manyFiles && row.tile !== PHOTO_TILE && <small className="layer-file" title={row.path}>{baseName(row.path)}</small>}
                     </div>
-                    {canEdit && editing === row.tile ? (
+                    {canEdit && editing === row.id ? (
                       <div className="layer-prompt-edit" onClick={(event) => event.stopPropagation()}>
                         <textarea
                           rows={3}
@@ -429,7 +507,7 @@ export default function App() {
                           aria-label={`The prompt of ${row.name}`}
                           onFocus={(event) => { editCancelled.current = false; event.currentTarget.select(); }}
                           onBlur={(event) => {
-                            if (!editCancelled.current) keepPrompt(row.tile, event.currentTarget.value);
+                            if (!editCancelled.current) keepPrompt(row, event.currentTarget.value);
                             editCancelled.current = false;
                             setEditing(null);
                           }}
@@ -439,14 +517,14 @@ export default function App() {
                           }}
                         />
                         <small>
-                          Enter keeps the prompt. Esc cancels. {job ? "The clips of this layer that start after this use the new prompt." : "The document does not change."}
-                          {!job && prompts.has(row.tile) && (
+                          Enter keeps the prompt. Esc cancels. {waits ? "The file does not change." : "The clips of this layer that start after this use the new prompt."}
+                          {waits && prompts.has(row.key) && (
                             <button
                               className="link-button"
                               onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => { editCancelled.current = true; setPrompt(row.tile, documentPrompts.get(row.tile) ?? ""); setEditing(null); }}
+                              onClick={() => { editCancelled.current = true; setPrompt(row.key, info?.prompt ?? ""); setEditing(null); }}
                             >
-                              Restore the document's prompt
+                              Restore the file's prompt
                             </button>
                           )}
                         </small>
@@ -454,7 +532,7 @@ export default function App() {
                     ) : (
                       <div className="layer-prompt" title={row.prompt}>
                         {row.prompt || "No prompt: Wan 2.2 chooses the motion."}
-                        {!job && prompts.has(row.tile) && <em> (changed)</em>}
+                        {waits && prompts.has(row.key) && <em> (changed)</em>}
                       </div>
                     )}
                   </div>
@@ -476,7 +554,7 @@ export default function App() {
                           key={index}
                           number={index + 1}
                           clip={clip}
-                          current={snapshot.current && snapshot.current.stage !== "joining" && snapshot.current.layer === jobLayer && snapshot.current.clip === index ? snapshot.current : null}
+                          current={snapshot.current && snapshot.current.stage !== "joining" && snapshot.current.layer === row.jobLayer && snapshot.current.clip === index ? snapshot.current : null}
                           onError={setMessage}
                         />
                       ))}
@@ -485,19 +563,19 @@ export default function App() {
                   {canEdit && (
                     <button
                       className="layer-remove"
-                      title={job ? "Change this layer's prompt. The clips of this layer that start after this use the new prompt." : "Change this layer's prompt for the video. The document does not change."}
+                      title={waits ? "Change this layer's prompt for the video. The file does not change." : "Change this layer's prompt. The clips of this layer that start after this use the new prompt."}
                       aria-label={`Change the prompt of ${row.name}`}
-                      onClick={(event) => { event.stopPropagation(); setEditing(row.tile); }}
+                      onClick={(event) => { event.stopPropagation(); setEditing(row.id); }}
                     >
                       <PencilSimple size={15} />
                     </button>
                   )}
-                  {!job && (
+                  {waits && (
                     <button
                       className="layer-remove"
-                      title="Remove this layer from the list. The document does not change."
+                      title="Remove this layer from the list. The file does not change."
                       aria-label={`Remove ${row.name} from the list`}
-                      onClick={(event) => { event.stopPropagation(); removeLayer(row.tile); }}
+                      onClick={(event) => { event.stopPropagation(); removeLayer(row.key); }}
                     >
                       <X size={15} />
                     </button>
@@ -508,9 +586,9 @@ export default function App() {
           </div>
         </div>
 
-        {job && (
+        {job && previewLayer && (
           <aside className="preview">
-            <div className="preview-frame" style={{ aspectRatio: `${job.clipWidth} / ${job.clipHeight}` }}>
+            <div className="preview-frame" style={{ aspectRatio: `${previewLayer.clipWidth || 16} / ${previewLayer.clipHeight || 9}` }}>
               {preview ? <img src={preview} alt="The clip in work" /> : <FilmStrip size={36} weight="thin" />}
             </div>
             <div className="preview-caption">
@@ -545,8 +623,19 @@ export default function App() {
               <Play size={16} weight="fill" /> Start
             </button>
           )}
+          {job && stagedRows.length > 0 && (
+            <button
+              className="button primary large"
+              onClick={() => void start()}
+              disabled={!canStart}
+              title={chosenCount === 0 ? "Choose one layer or more."
+                : `Add ${chosenCount} ${chosenCount === 1 ? "layer" : "layers"} to the job, with ${clipsPerLayer} ${clipsPerLayer === 1 ? "clip" : "clips"} for each layer. ${snapshot.state === "paused" ? "The job stays paused." : "The job makes them after its other layers."}`}
+            >
+              <Plus size={16} weight="bold" /> Add to Job
+            </button>
+          )}
           {job && running && (
-            <button className="button primary large" onClick={() => void queuePause()} title="Stop the clip in work and remove the model from the GPU memory. Resume makes that clip again from its start.">
+            <button className={`button large ${stagedRows.length > 0 ? "secondary" : "primary"}`} onClick={() => void queuePause()} title="Stop the clip in work and remove the model from the GPU memory. Resume makes that clip again from its start.">
               <Pause size={16} weight="fill" /> Pause
             </button>
           )}
@@ -561,7 +650,7 @@ export default function App() {
             </button>
           )}
           {job && snapshot.state === "paused" && (
-            <button className="button primary large" onClick={() => void queueResume()} title="Load the model and go on with the job">
+            <button className={`button large ${stagedRows.length > 0 ? "secondary" : "primary"}`} onClick={() => void queueResume()} title="Load the model and go on with the job">
               <Play size={16} weight="fill" /> Resume
             </button>
           )}
@@ -573,7 +662,7 @@ export default function App() {
           {job && (
             <button
               className="button secondary large"
-              onClick={() => void clearDone()}
+              onClick={clearDone}
               disabled={!canClearDone}
               title={canClearDone
                 ? "Remove the finished clips and videos from the list. The videos stay in the folder."
@@ -583,7 +672,7 @@ export default function App() {
             </button>
           )}
           {job && !running && (
-            <button className={`button large ${snapshot.state === "finished" ? "primary" : "secondary"}`} onClick={() => void newJob()} title="Remove this job from the list. The finished videos stay in their folder.">
+            <button className={`button large ${snapshot.state === "finished" && stagedRows.length === 0 ? "primary" : "secondary"}`} onClick={() => void newJob()} title="Remove this job from the list and put its files back into the list. The finished videos stay in their folder.">
               <Plus size={16} weight="bold" /> New Job
             </button>
           )}

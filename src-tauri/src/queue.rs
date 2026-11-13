@@ -12,7 +12,9 @@ use crate::{
 };
 
 /**
- * The job: one document, and one video for each chosen layer. The user
+ * The job: one video for each chosen layer. The layers can come from many
+ * documents and photos, and more layers can be added while the job runs;
+ * each layer keeps its own file and its own clip size. The user
  * chooses how many 5-second clips a video has. The first clip starts from
  * the layer's picture. Each clip after it starts from the last picture of
  * the clip before, with the same prompt, so the clips continue one another.
@@ -20,8 +22,8 @@ use crate::{
  * and the clips are deleted.
  *
  * The job runs in the Rust side of the app, so it goes on while the window
- * is hidden in the tray. The clips are made one after the other, bottom
- * layer first.
+ * is hidden in the tray. The clips are made one after the other, in the
+ * order of the job's layers; a document's bottom layer is first.
  *
  * Pause stops the clip that is in work and ends the engine, which removes
  * the model from the GPU memory. The engine cannot keep half a clip, so
@@ -70,9 +72,26 @@ pub struct LayerJob {
     /// The layer's video: its clips, joined. The clips' own files are deleted when it is made.
     #[serde(default)]
     video: Option<String>,
+    /// The layer's document or photo.
+    #[serde(default)]
+    document: String,
+    /// The size of this layer's clips: the shape of its document.
+    #[serde(default)]
+    clip_width: u32,
+    #[serde(default)]
+    clip_height: u32,
 }
 
 impl LayerJob {
+    /// The start of the layer's file names. A photo has one layer, so the photo's own name is enough.
+    fn file_stem(&self) -> String {
+        if self.tile == document::PHOTO_TILE {
+            document_stem(&self.document)
+        } else {
+            format!("{}-{:02}-{}", document_stem(&self.document), self.index + 1, slug(&self.name))
+        }
+    }
+
     fn all_done(&self) -> bool {
         self.clips.iter().all(|clip| clip.status == ClipStatus::Done)
     }
@@ -81,14 +100,27 @@ impl LayerJob {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
-    document: String,
     output_dir: String,
-    clip_width: u32,
-    clip_height: u32,
     layers: Vec<LayerJob>,
+    /// A job list from before version 0.6 had one document for all its layers. `restore` moves these values to the layers.
+    #[serde(default, skip_serializing)]
+    document: String,
+    #[serde(default, skip_serializing)]
+    clip_width: u32,
+    #[serde(default, skip_serializing)]
+    clip_height: u32,
 }
 
 impl Job {
+    /// Gives each layer of an old job list the job's one document and clip size.
+    fn fill_layers_from_old_job(&mut self) {
+        for layer in self.layers.iter_mut().filter(|layer| layer.document.is_empty()) {
+            layer.document = self.document.clone();
+            layer.clip_width = self.clip_width;
+            layer.clip_height = self.clip_height;
+        }
+    }
+
     fn next_pending(&self) -> Option<(usize, usize)> {
         self.layers.iter().enumerate().find_map(|(layer, job)| {
             job.clips.iter().position(|clip| clip.status == ClipStatus::Pending).map(|clip| (layer, clip))
@@ -242,6 +274,7 @@ pub fn restore(app: &AppHandle) -> Queue {
         .flatten()
         .and_then(|bytes| serde_json::from_slice::<Job>(&bytes).ok());
     if let Some(job) = job.as_mut() {
+        job.fill_layers_from_old_job();
         for clip in job.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
             if clip.status == ClipStatus::Running {
                 clip.status = ClipStatus::Pending;
@@ -317,16 +350,24 @@ fn document_stem(document: &str) -> String {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StartRequest {
+pub struct StartLayer {
+    /// The layer's document or photo.
     document: String,
+    /// The layer's file in the document.
+    tile: String,
+    /// The prompt the user wrote in place of the document's prompt. The document itself does not change.
+    prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartRequest {
+    /// The folder for a new job's videos. A job that exists keeps its folder.
     output_dir: String,
     /// How many 5-second clips each layer's video has.
     clips: usize,
-    /// The layers to make a video of, by their file in the document.
-    tiles: Vec<String>,
-    /// The prompts the user changed, by the layer's file in the document. The document itself does not change.
-    #[serde(default)]
-    prompts: std::collections::HashMap<String, String>,
+    /// The layers to make a video of.
+    layers: Vec<StartLayer>,
 }
 
 #[tauri::command]
@@ -334,11 +375,69 @@ pub fn queue_get(queue: State<'_, Queue>) -> Snapshot {
     queue.lock().snapshot()
 }
 
-/// Starts a new job. It replaces a job that is paused or finished.
+/// Reads the documents of a start request and makes the job's layers: the documents in the request's order, each with its bottom layer first.
+fn layer_jobs(request: &[StartLayer], clips: usize) -> Result<Vec<LayerJob>, String> {
+    let mut documents: Vec<&str> = Vec::new();
+    for layer in request {
+        if !documents.contains(&layer.document.as_str()) {
+            documents.push(&layer.document);
+        }
+    }
+    let mut jobs = Vec::new();
+    for document in documents {
+        let path = Path::new(document);
+        let layers = document::read_layers(path)?;
+        let (clip_width, clip_height) = document::document_clip_size(path, &layers)?;
+        for (index, layer) in layers.into_iter().enumerate() {
+            let Some(asked) = request.iter().find(|asked| asked.document == document && asked.tile == layer.tile) else { continue };
+            jobs.push(LayerJob {
+                index,
+                prompt: asked.prompt.as_ref().map(|prompt| prompt.trim().to_string()).unwrap_or(layer.prompt),
+                tile: layer.tile,
+                name: layer.name,
+                clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
+                video: None,
+                document: crate::files::windows_path(document),
+                clip_width,
+                clip_height,
+            });
+        }
+    }
+    Ok(jobs)
+}
+
+/**
+ * Starts a job, or adds layers to the job that exists. A job that runs
+ * goes on and makes the new layers after its other layers. A paused job
+ * stays paused. A finished job starts again.
+ */
 #[tauri::command]
 pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<'_, Engine>, request: StartRequest) -> Result<(), String> {
-    if queue.is_running() {
-        return Err("A job is running. Pause it first.".into());
+    let missing = settings::load(&app).files.missing();
+    if !missing.is_empty() {
+        return Err(format!("Choose the Wan 2.2 {} in Settings.", missing.join(", ")));
+    }
+    let clips = request.clips.clamp(1, MAX_CLIPS_PER_LAYER);
+    let asked = request.layers;
+    let jobs = tauri::async_runtime::spawn_blocking(move || layer_jobs(&asked, clips))
+        .await
+        .map_err(|error| format!("Reading the document stopped unexpectedly: {error}"))??;
+    if jobs.is_empty() {
+        return Err("Choose one layer or more first.".into());
+    }
+    let mut saved = settings::load(&app);
+    saved.clips_per_layer = clips;
+    let mut inner = queue.lock();
+    if let Some(job) = inner.job.as_mut() {
+        job.layers.extend(jobs);
+        settings::save(&app, &saved)?;
+        if inner.state == RunState::Finished {
+            spawn_runner(&app, &queue, &engine, &mut inner);
+        } else {
+            save_job(&app, inner.job.as_ref());
+            publish(&app, &inner);
+        }
+        return Ok(());
     }
     let output_dir = crate::files::windows_path(&request.output_dir);
     let output = PathBuf::from(&output_dir);
@@ -346,50 +445,9 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
         return Err("Choose the folder for the videos first.".into());
     }
     std::fs::create_dir_all(&output).map_err(|error| format!("Could not use the folder {}: {error}", output.display()))?;
-    let missing = settings::load(&app).files.missing();
-    if !missing.is_empty() {
-        return Err(format!("Choose the Wan 2.2 {} in Settings.", missing.join(", ")));
-    }
-    let document_path = request.document.clone();
-    let (layers, size) = tauri::async_runtime::spawn_blocking(move || {
-        let layers = document::read_layers(Path::new(&document_path))?;
-        let size = document::document_clip_size(Path::new(&document_path), &layers)?;
-        Ok::<_, String>((layers, size))
-    })
-    .await
-    .map_err(|error| format!("Reading the document stopped unexpectedly: {error}"))??;
-    let clips = request.clips.clamp(1, MAX_CLIPS_PER_LAYER);
-    let jobs: Vec<LayerJob> = layers
-        .into_iter()
-        .enumerate()
-        .filter(|(_, layer)| request.tiles.contains(&layer.tile))
-        .map(|(index, layer)| LayerJob {
-            index,
-            prompt: request.prompts.get(&layer.tile).map(|prompt| prompt.trim().to_string()).unwrap_or(layer.prompt),
-            tile: layer.tile,
-            name: layer.name,
-            clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
-            video: None,
-        })
-        .collect();
-    if jobs.is_empty() {
-        return Err("Choose one layer or more first.".into());
-    }
-    let job = Job {
-        document: crate::files::windows_path(&request.document),
-        output_dir: output.to_string_lossy().into_owned(),
-        clip_width: size.0,
-        clip_height: size.1,
-        layers: jobs,
-    };
-    let mut saved = settings::load(&app);
+    let job = Job { output_dir: output.to_string_lossy().into_owned(), layers: jobs, document: String::new(), clip_width: 0, clip_height: 0 };
     saved.output_dir = job.output_dir.clone();
-    saved.clips_per_layer = clips;
     settings::save(&app, &saved)?;
-    let mut inner = queue.lock();
-    if inner.state == RunState::Running {
-        return Err("A job is running. Pause it first.".into());
-    }
     inner.job = Some(job);
     spawn_runner(&app, &queue, &engine, &mut inner);
     Ok(())
@@ -541,13 +599,9 @@ pub fn queue_cancel_clip(app: AppHandle, queue: State<'_, Queue>, engine: State<
  * change.
  */
 #[tauri::command]
-pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, tile: String, prompt: String) -> Result<(), String> {
+pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, prompt: String) -> Result<(), String> {
     let mut inner = queue.lock();
-    let layer = inner
-        .job
-        .as_mut()
-        .and_then(|job| job.layers.iter_mut().find(|layer| layer.tile == tile))
-        .ok_or("The job does not have this layer.")?;
+    let layer = inner.job.as_mut().and_then(|job| job.layers.get_mut(layer)).ok_or("The job does not have this layer.")?;
     if layer.video.is_some() {
         return Err("This layer's video is done, so its prompt cannot change.".into());
     }
@@ -571,78 +625,85 @@ fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change
     Some(result)
 }
 
-/// Makes the job's clips, one after the other. When a layer's clips are all done, it joins them into the layer's video.
+/**
+ * Makes the job's clips, one after the other. When a layer's clips are all
+ * done, it joins them into the layer's video. The user can add layers while
+ * the job runs, so the runner looks for a new clip again before it ends.
+ */
 async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
     let mut picture: Option<(usize, String)> = None;
     let mut failures_in_a_row = 0_u32;
-    /* When the user cancelled a layer's last clip, the layer's other clips are all done and wait for the join. */
-    let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
-    for layer in 0..layers {
-        if join_layer(&app, &queue, generation, layer).await.is_none() {
-            return;
-        }
-    }
     loop {
-        let next = update(&app, &queue, generation, true, |inner| {
-            let job = inner.job.as_mut()?;
-            let (layer, clip) = job.next_pending()?;
-            job.layers[layer].clips[clip].status = ClipStatus::Running;
-            let work = (layer, clip, job.clone());
-            inner.current = Some(Current { layer, clip, stage: "preparing", progress: 0.0 });
-            Some(work)
-        });
-        let Some(next) = next else { return };
-        let Some((layer, clip, job)) = next else { break };
-        let made = make_one(&app, &queue, &engine, generation, &job, layer, clip, &mut picture).await;
-        failures_in_a_row = if made.is_ok() { 0 } else { failures_in_a_row + 1 };
-        let stop = failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
-        let updated = update(&app, &queue, generation, true, |inner| {
-            let Some(job) = inner.job.as_mut() else { return };
-            let clips = &mut job.layers[layer].clips;
-            match &made {
-                Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false },
-                Err(error) => {
-                    clips[clip] = Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()), cleared: false };
-                    /* The clips after it have no picture to start from. Retry makes them again, in order. */
-                    for later in clips[clip + 1..].iter_mut().filter(|later| later.status == ClipStatus::Pending) {
-                        later.status = ClipStatus::Failed;
-                        later.error = Some("The clip before this one failed, so this clip was not made.".into());
+        /* A layer can have all its clips done but not joined: the user cancelled its last clip, or the app closed before the join. */
+        let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
+        for layer in 0..layers {
+            if join_layer(&app, &queue, generation, layer).await.is_none() {
+                return;
+            }
+        }
+        loop {
+            let next = update(&app, &queue, generation, true, |inner| {
+                let job = inner.job.as_mut()?;
+                let (layer, clip) = job.next_pending()?;
+                job.layers[layer].clips[clip].status = ClipStatus::Running;
+                let work = (layer, clip, job.clone());
+                inner.current = Some(Current { layer, clip, stage: "preparing", progress: 0.0 });
+                Some(work)
+            });
+            let Some(next) = next else { return };
+            let Some((layer, clip, job)) = next else { break };
+            let made = make_one(&app, &queue, &engine, generation, &job, layer, clip, &mut picture).await;
+            failures_in_a_row = if made.is_ok() { 0 } else { failures_in_a_row + 1 };
+            let stop = failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
+            let updated = update(&app, &queue, generation, true, |inner| {
+                let Some(job) = inner.job.as_mut() else { return };
+                let clips = &mut job.layers[layer].clips;
+                match &made {
+                    Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false },
+                    Err(error) => {
+                        clips[clip] = Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()), cleared: false };
+                        /* The clips after it have no picture to start from. Retry makes them again, in order. */
+                        for later in clips[clip + 1..].iter_mut().filter(|later| later.status == ClipStatus::Pending) {
+                            later.status = ClipStatus::Failed;
+                            later.error = Some("The clip before this one failed, so this clip was not made.".into());
+                        }
                     }
                 }
+                if stop {
+                    inner.state = RunState::Paused;
+                    inner.current = None;
+                    inner.task = None;
+                    inner.generation += 1;
+                    inner.error = made.as_ref().err().map(|error| format!("The job paused because {MAX_FAILURES_IN_A_ROW} clips failed one after the other. {error}"));
+                }
+            });
+            if updated.is_none() {
+                return;
             }
             if stop {
-                inner.state = RunState::Paused;
-                inner.current = None;
-                inner.task = None;
-                inner.generation += 1;
-                inner.error = made.as_ref().err().map(|error| format!("The job paused because {MAX_FAILURES_IN_A_ROW} clips failed one after the other. {error}"));
+                engine.stop();
+                return;
             }
+            if made.is_ok() && join_layer(&app, &queue, generation, layer).await.is_none() {
+                return;
+            }
+        }
+        /* Every clip is done or failed: the engine ends, so the model leaves the GPU memory. This is before the job becomes finished, so a runner that starts after this one cannot lose its engine. */
+        engine.stop();
+        let finished = update(&app, &queue, generation, true, |inner| {
+            if inner.job.as_ref().is_some_and(|job| job.next_pending().is_some()) {
+                return false;
+            }
+            inner.state = RunState::Finished;
+            inner.current = None;
+            inner.task = None;
+            true
         });
-        if updated.is_none() {
-            return;
-        }
-        if stop {
-            engine.stop();
-            return;
-        }
-        if made.is_ok() && join_layer(&app, &queue, generation, layer).await.is_none() {
-            return;
+        match finished {
+            None | Some(true) => return,
+            Some(false) => {}
         }
     }
-    /* Every clip is done or failed: the engine ends, so the model leaves the GPU memory. */
-    engine.stop();
-    /* A job from before the app closed can have a layer whose clips are done but not joined. */
-    let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
-    for layer in 0..layers {
-        if join_layer(&app, &queue, generation, layer).await.is_none() {
-            return;
-        }
-    }
-    update(&app, &queue, generation, true, |inner| {
-        inner.state = RunState::Finished;
-        inner.current = None;
-        inner.task = None;
-    });
 }
 
 /**
@@ -665,8 +726,7 @@ async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, layer: usiz
         if files.len() != layer_job.clips.len() {
             return None;
         }
-        let name = format!("{}-{:02}-{}", document_stem(&job.document), layer_job.index + 1, slug(&layer_job.name));
-        let target = unused_path(Path::new(&job.output_dir), &name);
+        let target = unused_path(Path::new(&job.output_dir), &layer_job.file_stem());
         inner.current = Some(Current { layer, clip: 0, stage: "joining", progress: 0.0 });
         Some((files, target, layer_job.name.clone()))
     })?;
@@ -730,12 +790,12 @@ async fn make_one(
     picture: &mut Option<(usize, String)>,
 ) -> Result<String, String> {
     let layer_job = &job.layers[layer];
-    let size = (job.clip_width, job.clip_height);
+    let size = (layer_job.clip_width, layer_job.clip_height);
     let continued;
     let image = if clip == 0 {
         /* The first clip starts from the layer's picture. It is kept, so Retry does not make it again. */
         if picture.as_ref().is_none_or(|(made_for, _)| *made_for != layer) {
-            let (document, index) = (job.document.clone(), layer_job.index);
+            let (document, index) = (layer_job.document.clone(), layer_job.index);
             let data_url = tauri::async_runtime::spawn_blocking(move || {
                 let layers = document::read_layers(Path::new(&document))?;
                 if index >= layers.len() {
@@ -776,7 +836,7 @@ async fn make_one(
         Step::Finishing => report("finishing", 1.0),
     })
     .await?;
-    let name = format!("{}-{:02}-{}-{}", document_stem(&job.document), layer_job.index + 1, slug(&layer_job.name), clip + 1);
+    let name = format!("{}-{}", layer_job.file_stem(), clip + 1);
     let path = unused_path(Path::new(&job.output_dir), &name);
     std::fs::write(&path, bytes).map_err(|error| format!("Could not save {}: {error}", path.display()))?;
     Ok(path.to_string_lossy().into_owned())
@@ -788,10 +848,10 @@ mod tests {
 
     fn job(statuses: &[[ClipStatus; 3]]) -> Job {
         Job {
-            document: r"D:\Art\My Fox (final).imagesage".into(),
+            document: String::new(),
             output_dir: r"D:\Out".into(),
-            clip_width: 832,
-            clip_height: 464,
+            clip_width: 0,
+            clip_height: 0,
             layers: statuses
                 .iter()
                 .enumerate()
@@ -806,9 +866,35 @@ mod tests {
                         .map(|(clip, &status)| Clip { status, file: (status == ClipStatus::Done).then(|| format!("{index}-{clip}.webm")), error: None, cleared: false })
                         .collect(),
                     video: None,
+                    document: r"D:\Art\My Fox (final).imagesage".into(),
+                    clip_width: 832,
+                    clip_height: 464,
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn an_old_job_list_gives_its_document_to_each_layer() {
+        let old = serde_json::json!({
+            "document": "D:/a.imagesage", "outputDir": "D:/Out", "clipWidth": 832, "clipHeight": 464,
+            "layers": [{ "index": 0, "tile": "history/0001-layer.png", "name": "Fox", "prompt": "", "clips": [] }]
+        });
+        let mut job: Job = serde_json::from_value(old).unwrap();
+        job.fill_layers_from_old_job();
+        assert_eq!((job.layers[0].document.as_str(), job.layers[0].clip_width, job.layers[0].clip_height), ("D:/a.imagesage", 832, 464));
+        let saved = serde_json::to_value(&job).unwrap();
+        assert!(saved.get("document").is_none());
+        assert_eq!(saved["layers"][0]["clipWidth"], 832);
+    }
+
+    #[test]
+    fn a_photo_has_a_short_file_name() {
+        let mut job = job(&[[ClipStatus::Pending; 3]]);
+        assert_eq!(job.layers[0].file_stem(), "My-Fox-final-01-Layer-1");
+        job.layers[0].tile = document::PHOTO_TILE.into();
+        job.layers[0].document = r"D:\Photos\Beach day.jpg".into();
+        assert_eq!(job.layers[0].file_stem(), "Beach-day");
     }
 
     #[test]

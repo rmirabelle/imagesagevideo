@@ -29,6 +29,12 @@
 - A runner may change the job only through `queue::update`, which checks the
   runner's generation. Pause, a new start and clear raise the generation, so
   a runner that was stopped cannot write stale state.
+- A job's layers can come from many documents and photos. Each layer keeps
+  its own file path and clip size (`LayerJob`). `queue_start` starts a job,
+  or adds layers to the job that exists; the runner looks for a new clip
+  again before it ends, so layers that are added while it runs are made.
+  The window keeps the opened files whose layers wait for Start
+  (`src/App.tsx`); those layers are not in the job.
 - Cancel Clip (`queue_cancel_clip`) removes the clip in work from its layer and
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start
