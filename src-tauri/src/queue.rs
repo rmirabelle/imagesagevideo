@@ -309,6 +309,9 @@ pub struct StartRequest {
     clips: usize,
     /// The layers to make a video of, by their file in the document.
     tiles: Vec<String>,
+    /// The prompts the user changed, by the layer's file in the document. The document itself does not change.
+    #[serde(default)]
+    prompts: std::collections::HashMap<String, String>,
 }
 
 #[tauri::command]
@@ -347,9 +350,9 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
         .filter(|(_, layer)| request.tiles.contains(&layer.tile))
         .map(|(index, layer)| LayerJob {
             index,
+            prompt: request.prompts.get(&layer.tile).map(|prompt| prompt.trim().to_string()).unwrap_or(layer.prompt),
             tile: layer.tile,
             name: layer.name,
-            prompt: layer.prompt,
             clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
             video: None,
         })

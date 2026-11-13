@@ -119,8 +119,10 @@ export interface FoundModels {
 }
 
 export const openDocument = (path: string) => invoke<DocumentInfo>("open_document", { path });
-export const queueGet = () => invoke<Snapshot>("queue_get");
-export const queueStart = (request: { document: string; outputDir: string; clips: number; tiles: string[] }) =>
+/** One layer's own picture, large, as a JPEG data URL. */
+export const layerPicture = (path: string, tile: string) => invoke<string>("layer_picture", { path, tile });
+export const queueGet =() => invoke<Snapshot>("queue_get");
+export const queueStart = (request: { document: string; outputDir: string; clips: number; tiles: string[]; prompts: Record<string, string> }) =>
   invoke<void>("queue_start", { request });
 export const queuePause = () => invoke<void>("queue_pause");
 export const queueResume = () => invoke<void>("queue_resume");

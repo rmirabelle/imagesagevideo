@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use image::{imageops, RgbaImage};
+use image::{imageops, ImageDecoder, RgbaImage};
 use serde::Serialize;
 use serde_json::Value;
 use std::{fs::File, io::Read, path::Path};
@@ -13,6 +13,9 @@ use crate::clip_size::{clip_size, SMALL_PIXELS};
  * document; it never changes it and never writes a layer's picture to the
  * disk. A clip starts from the layer's own picture; where that picture is
  * transparent, the layers below it show.
+ *
+ * It also reads a photo: a plain PNG, JPEG or WebP file. A photo is a
+ * document with one layer and no prompt.
  */
 const DOCUMENT_FORMAT: &str = "imagesage-document";
 /// Version 2 stores the original image as a separate tile; version 3 stores it as the bottom layer.
@@ -22,6 +25,8 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_LAYERS: usize = 2000;
 const THUMBNAIL_SIDE: u32 = 112;
+/// The longest side of the large picture that a click on a layer's small picture shows.
+const LARGE_SIDE: u32 = 2048;
 
 /// One layer of a document, bottom layer first.
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +60,41 @@ pub struct DocumentInfo {
     clip_width: Option<u32>,
     clip_height: Option<u32>,
     layers: Vec<LayerInfo>,
+}
+
+/// The file of a photo's one layer. No layer of an Image Sage document can have this name.
+pub const PHOTO_TILE: &str = "photo";
+const PHOTO_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+/// The path names a plain picture file, not an Image Sage document.
+pub fn is_photo(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| PHOTO_EXTENSIONS.iter().any(|known| extension.eq_ignore_ascii_case(known)))
+}
+
+/// A photo's picture, turned upright as the camera recorded it.
+fn read_photo(path: &Path) -> Result<RgbaImage, String> {
+    let failed = |error: &dyn std::fmt::Display| format!("Could not read the photo: {error}");
+    if std::fs::metadata(path).map_err(|error| failed(&error))?.len() > MAX_IMAGE_BYTES {
+        return Err("The photo is too large to open safely".into());
+    }
+    let mut decoder = image::ImageReader::open(path)
+        .map_err(|error| failed(&error))?
+        .with_guessed_format()
+        .map_err(|error| failed(&error))?
+        .into_decoder()
+        .map_err(|error| failed(&error))?;
+    let orientation = decoder.orientation().map_err(|error| failed(&error))?;
+    let mut picture = image::DynamicImage::from_decoder(decoder).map_err(|error| failed(&error))?;
+    picture.apply_orientation(orientation);
+    Ok(picture.into_rgba8())
+}
+
+/// The one layer of a photo. Its name is the file's name; the user gives the prompt in the window.
+fn photo_layer(path: &Path) -> LayerRef {
+    let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_else(|| "Photo".into());
+    LayerRef { tile: PHOTO_TILE.into(), name, prompt: String::new(), hidden: false }
 }
 
 fn is_tile_path(path: &str) -> bool {
@@ -153,6 +193,9 @@ fn read_layer(archive: &mut ZipArchive<File>, tile: &str) -> Result<RgbaImage, S
 
 /// The layers of a document, bottom layer first.
 pub fn read_layers(path: &Path) -> Result<Vec<LayerRef>, String> {
+    if is_photo(path) {
+        return Ok(vec![photo_layer(path)]);
+    }
     read_manifest(&mut open_archive(path)?)
 }
 
@@ -168,7 +211,7 @@ fn document_size(archive: &mut ZipArchive<File>, layers: &[LayerRef]) -> Result<
 
 /// The size of a document's clips. Every clip has the document's shape, so the clips can be joined.
 pub fn document_clip_size(path: &Path, layers: &[LayerRef]) -> Result<(u32, u32), String> {
-    let (width, height) = document_size(&mut open_archive(path)?, layers)?;
+    let (width, height) = if is_photo(path) { read_photo(path)?.dimensions() } else { document_size(&mut open_archive(path)?, layers)? };
     clip_size(width, height, SMALL_PIXELS).ok_or_else(|| "The document is wider or taller than 3:1; Wan 2.2 cannot make a clip of that shape.".to_string())
 }
 
@@ -188,6 +231,11 @@ fn flatten(width: u32, height: u32, layers: Vec<RgbaImage>) -> RgbaImage {
  * the layer is transparent, the layers below it show.
  */
 pub fn layer_start_picture(path: &Path, layers: &[LayerRef], index: usize, width: u32, height: u32) -> Result<String, String> {
+    if is_photo(path) {
+        let photo = read_photo(path)?;
+        let (photo_width, photo_height) = photo.dimensions();
+        return start_url(flatten(photo_width, photo_height, vec![photo]), width, height);
+    }
     let mut archive = open_archive(path)?;
     let mut stack = Vec::new();
     for layer in layers[..=index].iter().rev() {
@@ -200,7 +248,11 @@ pub fn layer_start_picture(path: &Path, layers: &[LayerRef], index: usize, width
     }
     stack.reverse();
     let (doc_width, doc_height) = document_size(&mut archive, layers)?;
-    let flat = flatten(doc_width, doc_height, stack);
+    start_url(flatten(doc_width, doc_height, stack), width, height)
+}
+
+/// A flat picture at the clip size, as a PNG data URL.
+fn start_url(flat: RgbaImage, width: u32, height: u32) -> Result<String, String> {
     let clip = imageops::resize(&flat, width, height, imageops::FilterType::Lanczos3);
     let rgb = image::DynamicImage::ImageRgba8(clip).into_rgb8();
     let mut png = Vec::new();
@@ -210,9 +262,13 @@ pub fn layer_start_picture(path: &Path, layers: &[LayerRef], index: usize, width
 }
 
 fn thumbnail(picture: &RgbaImage) -> Result<String, String> {
-    let small = imageops::thumbnail(picture, THUMBNAIL_SIDE * 2, THUMBNAIL_SIDE);
+    jpeg_url(&imageops::thumbnail(picture, THUMBNAIL_SIDE * 2, THUMBNAIL_SIDE))
+}
+
+/// A picture as a JPEG data URL. Where the picture is transparent, the list's dark color shows.
+fn jpeg_url(small: &RgbaImage) -> Result<String, String> {
     let mut canvas = RgbaImage::from_pixel(small.width(), small.height(), image::Rgba([0x1d, 0x20, 0x29, 255]));
-    imageops::overlay(&mut canvas, &small, 0, 0);
+    imageops::overlay(&mut canvas, small, 0, 0);
     let mut jpeg = Vec::new();
     image::DynamicImage::ImageRgba8(canvas)
         .into_rgb8()
@@ -222,12 +278,19 @@ fn thumbnail(picture: &RgbaImage) -> Result<String, String> {
 }
 
 fn document_info(path: &Path) -> Result<DocumentInfo, String> {
-    let mut archive = open_archive(path)?;
-    let layers = read_manifest(&mut archive)?;
+    let photo = is_photo(path);
+    let mut archive = if photo { None } else { Some(open_archive(path)?) };
+    let layers = match archive.as_mut() {
+        Some(archive) => read_manifest(archive)?,
+        None => vec![photo_layer(path)],
+    };
     let mut size = (0, 0);
     let mut infos = Vec::with_capacity(layers.len());
     for (index, layer) in layers.into_iter().enumerate() {
-        let picture = read_layer(&mut archive, &layer.tile)?;
+        let picture = match archive.as_mut() {
+            Some(archive) => read_layer(archive, &layer.tile)?,
+            None => read_photo(path)?,
+        };
         if index == 0 {
             size = picture.dimensions();
         }
@@ -250,6 +313,32 @@ pub async fn open_document(path: String) -> Result<DocumentInfo, String> {
     tauri::async_runtime::spawn_blocking(move || document_info(Path::new(&path)))
         .await
         .map_err(|error| format!("Reading the document stopped unexpectedly: {error}"))?
+}
+
+/**
+ * One layer's own picture, large, as a JPEG data URL: the picture the
+ * window shows when the user clicks a layer's small picture. It goes to the
+ * window in memory only.
+ */
+#[tauri::command]
+pub async fn layer_picture(path: String, tile: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&path);
+        let picture = if is_photo(path) {
+            read_photo(path)?
+        } else if is_tile_path(&tile) {
+            read_layer(&mut open_archive(path)?, &tile)?
+        } else {
+            return Err(format!("The document references an invalid layer file: {tile}"));
+        };
+        if picture.width().max(picture.height()) > LARGE_SIDE {
+            jpeg_url(&imageops::thumbnail(&picture, LARGE_SIDE, LARGE_SIDE))
+        } else {
+            jpeg_url(&picture)
+        }
+    })
+    .await
+    .map_err(|error| format!("Reading the layer stopped unexpectedly: {error}"))?
 }
 
 #[cfg(test)]
@@ -345,6 +434,25 @@ mod tests {
         assert_eq!(through.get_pixel(5, 5).0, [255, 0, 0, 255]);
         let top = decode(&layer_start_picture(&path, &layers, 2, 32, 16).unwrap());
         assert_eq!(top.get_pixel(5, 5).0, [0, 255, 0, 255]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_photo_is_a_document_with_one_layer() {
+        let path = std::env::temp_dir().join(format!("imagesagevideo-My Photo-{}.PNG", std::process::id()));
+        std::fs::write(&path, png(64, 32, [0, 0, 255, 255])).unwrap();
+        assert!(is_photo(&path));
+        assert!(!is_photo(Path::new("fox.imagesage")));
+        let layers = read_layers(&path).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!((layers[0].tile.as_str(), layers[0].prompt.as_str()), (PHOTO_TILE, ""));
+        assert!(layers[0].name.starts_with("imagesagevideo-My Photo"));
+        assert!(document_clip_size(&path, &layers).is_ok());
+        let start = decode(&layer_start_picture(&path, &layers, 0, 32, 16).unwrap());
+        assert_eq!(start.dimensions(), (32, 16));
+        assert_eq!(start.get_pixel(5, 5).0, [0, 0, 255, 255]);
+        let info = document_info(&path).unwrap();
+        assert_eq!((info.width, info.height, info.layers.len()), (64, 32, 1));
         std::fs::remove_file(path).unwrap();
     }
 }

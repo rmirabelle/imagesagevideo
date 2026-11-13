@@ -15,11 +15,11 @@ use tauri::{Emitter, Manager, State, WindowEvent};
 
 struct PendingOpenDocument(Mutex<Option<String>>);
 
-/// The first argument that names an Image Sage document.
+/// The first argument that names an Image Sage document or a photo.
 fn document_from_args(args: &[String], cwd: &str) -> Option<String> {
     args.iter().skip(1).find_map(|argument| {
         let path = Path::new(argument);
-        if !path.extension()?.to_str()?.eq_ignore_ascii_case("imagesage") {
+        if !path.extension()?.to_str()?.eq_ignore_ascii_case("imagesage") && !document::is_photo(path) {
             return None;
         }
         let resolved = if path.is_absolute() { path.to_path_buf() } else { Path::new(cwd).join(path) };
@@ -104,6 +104,7 @@ pub fn run() {
             files::log_frontend_error,
             files::cursor_position,
             document::open_document,
+            document::layer_picture,
             engine::engine_status,
             engine::engine_download,
             engine::find_models,
@@ -136,6 +137,9 @@ mod tests {
         let args = vec!["imagesagevideo.exe".into(), "Poster.IMAGESAGE".into()];
         assert_eq!(document_from_args(&args, r"C:\Images"), Some(r"C:\Images\Poster.IMAGESAGE".into()));
         let args = vec!["imagesagevideo.exe".into(), r"D:\photo.png".into()];
+        assert_eq!(document_from_args(&args, r"C:\Images"), Some(r"D:\photo.png".into()));
+        let args = vec!["imagesagevideo.exe".into(), r"D:
+otes.txt".into()];
         assert_eq!(document_from_args(&args, r"C:\Images"), None);
     }
 }

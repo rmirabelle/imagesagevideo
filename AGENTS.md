@@ -37,6 +37,9 @@
 - `src-tauri/src/document.rs` only reads `.imagesage` documents (format
   versions 2 and 3). The format belongs to Image Sage; follow its
   `src-tauri/src/document.rs` and `src/editor/document.ts`.
+- `document.rs` also reads a photo (a plain PNG, JPEG or WebP file) as a
+  document with one layer, whose file name is `photo` and whose prompt is
+  empty. The user writes the prompt in the window.
 - `src-tauri/src/clip_size.rs` must give the same sizes as Image Sage's
   `src/editor/clipSize.ts`.
 - Each layer becomes one video of 1 to 20 clips. Clip 1 starts from the

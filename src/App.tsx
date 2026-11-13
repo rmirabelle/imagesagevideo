@@ -8,19 +8,21 @@ import {
   FilmStrip,
   FolderOpen,
   Pause,
+  PencilSimple,
   Play,
   Plus,
   Trash,
   WarningCircle,
   X
 } from "@phosphor-icons/react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AboutDialog } from "./components/AboutDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
 import {
   baseName,
   hideToTray,
+  layerPicture,
   openDocument,
   playVideo,
   queueClear,
@@ -42,6 +44,8 @@ import { checkForUpdate, getAppVersion, type UpdateInfo } from "./lib/updater";
 
 const CLIP_SECONDS = 5;
 const MAX_CLIPS_PER_LAYER = 20;
+/** The file name the Rust side gives to the one layer of a photo. */
+const PHOTO_TILE = "photo";
 const EMPTY: Snapshot = { job: null, state: "idle", current: null, error: null, clipsDone: 0, clipsFailed: 0, clipsTotal: 0 };
 
 const STAGE_TEXT: Record<Current["stage"], string> = {
@@ -71,6 +75,13 @@ export default function App() {
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   /* The layers the user removed from the list. The document does not change, and they come back when it is opened again. */
   const [removed, setRemoved] = useState<Set<string>>(new Set());
+  /* The prompts the user changed, by layer. The document does not change; the job gets these prompts. */
+  const [prompts, setPrompts] = useState<Map<string, string>>(new Map());
+  /* The layer whose prompt is in the text box now. */
+  const [editing, setEditing] = useState<string | null>(null);
+  const editCancelled = useRef(false);
+  /* The layer whose large picture shows. The small picture shows first, until the large one is read. */
+  const [zoom, setZoom] = useState<{ tile: string; name: string; src: string } | null>(null);
   const [outputDir, setOutputDir] = useState("");
   const [clipsPerLayer, setClipsPerLayer] = useState(2);
   const [missing, setMissing] = useState<string[]>([]);
@@ -93,6 +104,9 @@ export default function App() {
       const opened = await openDocument(path);
       setInfo(opened);
       setRemoved(new Set());
+      setPrompts(new Map());
+      /* A photo has no prompt, so its text box opens at once. */
+      setEditing(selectAll && opened.layers.length === 1 && opened.layers[0].tile === PHOTO_TILE ? PHOTO_TILE : null);
       if (selectAll) setChosen(new Set(opened.layers.map((layer) => layer.tile)));
     } catch (error) {
       setMessage(String(error));
@@ -141,7 +155,11 @@ export default function App() {
   }, [snapshot.current?.layer, snapshot.current?.clip, snapshot.current?.stage]);
 
   const chooseDocument = async () => {
-    const picked = await open({ multiple: false, filters: [{ name: "Image Sage documents", extensions: ["imagesage"] }] });
+    const picked = await open({ multiple: false, filters: [
+      { name: "Image Sage documents and photos", extensions: ["imagesage", "png", "jpg", "jpeg", "webp"] },
+      { name: "Image Sage documents", extensions: ["imagesage"] },
+      { name: "Photos", extensions: ["png", "jpg", "jpeg", "webp"] }
+    ] });
     if (typeof picked === "string") await loadDocument(picked, true);
   };
 
@@ -154,7 +172,7 @@ export default function App() {
     if (!info) return;
     setMessage(null);
     try {
-      await queueStart({ document: info.path, outputDir, clips: clipsPerLayer, tiles: [...chosen] });
+      await queueStart({ document: info.path, outputDir, clips: clipsPerLayer, tiles: [...chosen], prompts: Object.fromEntries(prompts) });
     } catch (error) {
       setMessage(String(error));
     }
@@ -165,6 +183,15 @@ export default function App() {
       await queueClear();
       setPreview(null);
       setMessage(null);
+      /* The job's prompts stay, so the user can change them again. This also brings them back after the app started again. */
+      if (job && info) {
+        const original = new Map(info.layers.map((layer) => [layer.tile, layer.prompt]));
+        setPrompts((current) => {
+          const next = new Map(current);
+          for (const layer of job.layers) if (original.has(layer.tile) && original.get(layer.tile) !== layer.prompt) next.set(layer.tile, layer.prompt);
+          return next;
+        });
+      }
       if (info) setChosen(new Set(info.layers.filter((layer) => !removed.has(layer.tile)).map((layer) => layer.tile)));
     } catch (error) {
       setMessage(String(error));
@@ -183,6 +210,49 @@ export default function App() {
     } catch (error) {
       setMessage(String(error));
     }
+  };
+
+  /* Closes the document, and removes a job that does not run. The document's file and the finished videos do not change. */
+  const clearDocument = async () => {
+    try {
+      if (job) await queueClear();
+      setInfo(null);
+      setChosen(new Set());
+      setRemoved(new Set());
+      setPrompts(new Map());
+      setEditing(null);
+      setPreview(null);
+      setMessage(null);
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  const zoomLayer = (tile: string, name: string) => {
+    const small = thumbnails.get(tile);
+    if (!info || !small) return;
+    setZoom({ tile, name, src: small });
+    layerPicture(info.path, tile)
+      .then((src) => setZoom((current) => (current?.tile === tile ? { ...current, src } : current)))
+      .catch((error) => setMessage(String(error)));
+  };
+
+  useEffect(() => {
+    if (!zoom) return;
+    const close = (event: KeyboardEvent) => { if (event.key === "Escape") setZoom(null); };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [zoom !== null]);
+
+  /* Keeps a changed prompt. A prompt that is the same as the document's prompt is not a change. */
+  const setPrompt = (tile: string, text: string) => {
+    const original = info?.layers.find((layer) => layer.tile === tile)?.prompt ?? "";
+    setPrompts((current) => {
+      const next = new Map(current);
+      if (text.trim() === original) next.delete(tile);
+      else next.set(tile, text.trim());
+      return next;
+    });
   };
 
   const toggle = (tile: string) => setChosen((current) => {
@@ -204,12 +274,13 @@ export default function App() {
   const listedLayers = (info?.layers ?? []).filter((layer) => !removed.has(layer.tile));
 
   const thumbnails = useMemo(() => new Map(info?.layers.map((layer) => [layer.tile, layer.thumbnail]) ?? []), [info]);
+  const documentPrompts = useMemo(() => new Map(info?.layers.map((layer) => [layer.tile, layer.prompt]) ?? []), [info]);
   const hiddenTiles = useMemo(() => new Set(info?.layers.filter((layer) => layer.hidden).map((layer) => layer.tile) ?? []), [info]);
 
   /* The rows: during a job, the job's layers; before it, the document's layers. Both lists have the bottom layer first; the list shows the top layer first, as Image Sage does. */
   const rows = job
     ? job.layers.filter((layer) => layer.clips.some((clip) => !clip.cleared)).map((layer) => ({ tile: layer.tile, number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips as Clip[] | null, video: layer.video }))
-    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: layer.prompt, clips: null as Clip[] | null, video: null as string | null })).filter((row) => !removed.has(row.tile));
+    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: prompts.get(layer.tile) ?? layer.prompt, clips: null as Clip[] | null, video: null as string | null })).filter((row) => !removed.has(row.tile));
   const shownRows = [...rows].reverse();
   /* The clips in the list. While the clips are joined, all of them are done and the list must not become empty. */
   const listedClips = rows.flatMap((row) => row.clips ?? []).filter((clip) => !clip.cleared);
@@ -221,7 +292,7 @@ export default function App() {
     ? (snapshot.clipsDone + snapshot.clipsFailed + (running && snapshot.current && snapshot.current.stage !== "joining" ? snapshot.current.progress : 0)) / snapshot.clipsTotal
     : 0;
   const canStart = !!info && !!info.clipWidth && chosen.size > 0 && outputDir.trim() !== "" && missing.length === 0;
-  const startHint = !info ? "Open an Image Sage document first."
+  const startHint = !info ? "Open an Image Sage document or a photo first."
     : !info.clipWidth ? "The document is wider or taller than 3:1; Wan 2.2 cannot make a clip of that shape."
     : missing.length ? `Choose the Wan 2.2 ${missing.join(", ")} in Settings.`
     : !outputDir.trim() ? "Choose the folder for the videos."
@@ -248,9 +319,19 @@ export default function App() {
             {job ? baseName(job.document) : info ? baseName(info.path) : <em>No document is open</em>}
             {info && <small>{info.width} × {info.height}{clipSize ? ` · clips ${clipSize}, 5 s` : ""}</small>}
           </div>
-          <button className="button secondary" onClick={() => void chooseDocument()} disabled={!!job || opening} title={job ? "Choose New Job first" : "Open an Image Sage document"}>
+          <div className="button-group">
+          <button className="button secondary" onClick={() => void chooseDocument()} disabled={!!job || opening} title={job ? "Choose New Job first" : "Open an Image Sage document or a photo"}>
             {opening ? <CircleNotch className="spin" size={15} /> : <FolderOpen size={15} />} Open…
           </button>
+          <button
+            className="button secondary"
+            onClick={() => void clearDocument()}
+            disabled={running || (!info && !job)}
+            title={running ? "Pause the job first" : job ? "Close the document and remove the job from the list. The finished videos stay in their folder." : "Close the document. The document's file does not change."}
+          >
+            <X size={15} /> Clear
+          </button>
+          </div>
         </div>
         <div className="setup-row">
           <span className="setup-label">Save videos in</span>
@@ -304,8 +385,8 @@ export default function App() {
             {shownRows.length === 0 && !(info && removed.size > 0) && (
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
-                <p>Open an Image Sage document.</p>
-                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt.</span>
+                <p>Open an Image Sage document or a photo.</p>
+                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here.</span>
               </div>
             )}
             {shownRows.map((row) => {
@@ -313,13 +394,57 @@ export default function App() {
               return (
                 <div className={`layer-row ${!job && !chosen.has(row.tile) ? "off" : ""}`} key={row.tile} onClick={() => !job && toggle(row.tile)}>
                   {!job && <input type="checkbox" checked={chosen.has(row.tile)} onChange={() => toggle(row.tile)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
-                  <div className="layer-thumb">{thumbnails.get(row.tile) ? <img src={thumbnails.get(row.tile)} alt="" /> : <FilmStrip size={20} />}</div>
+                  {thumbnails.get(row.tile) ? (
+                    <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row.tile, row.name); }}>
+                      <img src={thumbnails.get(row.tile)} alt="" />
+                    </button>
+                  ) : (
+                    <div className="layer-thumb"><FilmStrip size={20} /></div>
+                  )}
                   <div className="layer-text">
                     <div className="layer-name">
                       <b>{row.number}</b> {row.name}
                       {hiddenTiles.has(row.tile) && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
                     </div>
-                    <div className="layer-prompt" title={row.prompt}>{row.prompt || "No prompt: Wan 2.2 chooses the motion."}</div>
+                    {!job && editing === row.tile ? (
+                      <div className="layer-prompt-edit" onClick={(event) => event.stopPropagation()}>
+                        <textarea
+                          rows={3}
+                          autoFocus
+                          spellCheck={false}
+                          defaultValue={row.prompt}
+                          placeholder="No prompt: Wan 2.2 chooses the motion."
+                          aria-label={`The prompt of ${row.name}`}
+                          onFocus={(event) => { editCancelled.current = false; event.currentTarget.select(); }}
+                          onBlur={(event) => {
+                            if (!editCancelled.current) setPrompt(row.tile, event.currentTarget.value);
+                            editCancelled.current = false;
+                            setEditing(null);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Escape") { editCancelled.current = true; event.currentTarget.blur(); }
+                            else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.blur(); }
+                          }}
+                        />
+                        <small>
+                          Enter keeps the prompt. Esc cancels. The document does not change.
+                          {prompts.has(row.tile) && (
+                            <button
+                              className="link-button"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => { editCancelled.current = true; setPrompt(row.tile, documentPrompts.get(row.tile) ?? ""); setEditing(null); }}
+                            >
+                              Restore the document's prompt
+                            </button>
+                          )}
+                        </small>
+                      </div>
+                    ) : (
+                      <div className="layer-prompt" title={row.prompt}>
+                        {row.prompt || "No prompt: Wan 2.2 chooses the motion."}
+                        {!job && prompts.has(row.tile) && <em> (changed)</em>}
+                      </div>
+                    )}
                   </div>
                   {row.video && (
                     <div className="clips">
@@ -344,6 +469,16 @@ export default function App() {
                         />
                       ))}
                     </div>
+                  )}
+                  {!job && (
+                    <button
+                      className="layer-remove"
+                      title="Change this layer's prompt for the video. The document does not change."
+                      aria-label={`Change the prompt of ${row.name}`}
+                      onClick={(event) => { event.stopPropagation(); setEditing(row.tile); }}
+                    >
+                      <PencilSimple size={15} />
+                    </button>
                   )}
                   {!job && (
                     <button
@@ -435,6 +570,11 @@ export default function App() {
 
       {settingsOpen && <SettingsDialog onClose={() => { setSettingsOpen(false); void refreshSettings(); }} />}
       {aboutOpen && <AboutDialog version={version} initialUpdateInfo={updateInfo} onClose={() => setAboutOpen(false)} />}
+      {zoom && (
+        <div className="zoom-overlay" role="dialog" aria-modal="true" aria-label={zoom.name} title="Click to close" onClick={() => setZoom(null)}>
+          <img src={zoom.src} alt={zoom.name} />
+        </div>
+      )}
       {closeAsked && (
         <div className="dialog-overlay" role="presentation" onPointerDown={() => setCloseAsked(false)}>
           <div className="dialog confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="close-title" onPointerDown={(event) => event.stopPropagation()}>
