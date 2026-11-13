@@ -1,15 +1,19 @@
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
-import { CheckCircle, CircleNotch, DownloadSimple, FolderOpen, MagnifyingGlass, WarningCircle, X } from "@phosphor-icons/react";
-import { useEffect, useState } from "react";
+import { CheckCircle, CircleNotch, DotsSixVertical, DownloadSimple, FolderOpen, MagnifyingGlass, Plus, Trash, WarningCircle, X } from "@phosphor-icons/react";
+import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { LoraDialog } from "./LoraDialog";
 import {
+  baseName,
   engineDownload,
   engineStatus,
   findModels,
+  folderOf,
   settingsFromImageSage,
   settingsGet,
   settingsSet,
   type EngineStatus,
+  type LoraPair,
   type ModelFiles,
   type SettingsView
 } from "../lib/api";
@@ -18,7 +22,7 @@ interface Props {
   onClose: () => void;
 }
 
-type FileKey = "highNoiseModel" | "diffusionModel" | "textEncoder" | "vae" | "highNoiseLora" | "lora";
+type FileKey = "highNoiseModel" | "diffusionModel" | "textEncoder" | "vae";
 
 const MODEL_ROWS: { key: FileKey; label: string; help: string }[] = [
   { key: "highNoiseModel", label: "High-noise model", help: "Wan 2.2 image-to-video, high noise. It starts each clip." },
@@ -27,10 +31,10 @@ const MODEL_ROWS: { key: FileKey; label: string; help: string }[] = [
   { key: "vae", label: "VAE", help: "The Wan 2.1 VAE." }
 ];
 
-const LORA_ROWS: { key: FileKey; strength: "highNoiseLoraStrength" | "loraStrength"; label: string }[] = [
-  { key: "highNoiseLora", strength: "highNoiseLoraStrength", label: "High-noise LoRA" },
-  { key: "lora", strength: "loraStrength", label: "Low-noise LoRA" }
-];
+const LORA_SIDES = [
+  { file: "highNoise", strength: "highNoiseStrength", label: "High" },
+  { file: "lowNoise", strength: "lowNoiseStrength", label: "Low" }
+] as const;
 
 const MODEL_FILTER = [{ name: "Model files", extensions: ["safetensors", "gguf", "sft"] }];
 
@@ -46,11 +50,18 @@ export function SettingsDialog({ onClose }: Props) {
   const [download, setDownload] = useState<{ stage: string; progress: number } | null>(null);
   const [notice, setNotice] = useState<{ error: boolean; text: string } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [loraFolder, setLoraFolder] = useState("");
+  const [dragging, setDragging] = useState<number | null>(null);
+  const dragFrom = useRef<number | null>(null);
+  const loraList = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     void settingsGet().then((loaded) => {
       setView(loaded);
       setFiles(loaded.settings.files);
+      const last = loaded.settings.files.loras.at(-1);
+      setLoraFolder(loaded.settings.loraFolder || folderOf(last?.highNoise || last?.lowNoise || ""));
     });
     void engineStatus().then(setEngine);
   }, []);
@@ -62,17 +73,76 @@ export function SettingsDialog({ onClose }: Props) {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !download) onClose();
+      if (event.key !== "Escape" || download) return;
+      if (adding) setAdding(false);
+      else onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, download]);
+  }, [onClose, download, adding]);
 
   const change = (patch: Partial<ModelFiles>) => setFiles((current) => (current ? { ...current, ...patch } : current));
 
   const browse = async (key: FileKey) => {
     const picked = await open({ multiple: false, filters: MODEL_FILTER, defaultPath: files?.[key] || undefined });
     if (typeof picked === "string") change({ [key]: picked });
+  };
+
+  const changeLora = (index: number, patch: Partial<LoraPair>) =>
+    setFiles((current) => (current ? { ...current, loras: current.loras.map((pair, at) => (at === index ? { ...pair, ...patch } : pair)) } : current));
+
+  const removeLora = (index: number) =>
+    setFiles((current) => (current ? { ...current, loras: current.loras.filter((_, at) => at !== index) } : current));
+
+  const addLora = (pair: LoraPair) => {
+    setFiles((current) => (current ? { ...current, loras: [...current.loras, pair] } : current));
+    setAdding(false);
+  };
+
+  /** Keeps the folder of the last chosen LoRA file at once, so the file browser opens there also after Cancel. */
+  const rememberLoraFolder = async (folder: string) => {
+    setLoraFolder(folder);
+    try {
+      const latest = await settingsGet();
+      await settingsSet({ ...latest.settings, loraFolder: folder });
+    } catch {
+      /* The folder only makes the next choice quicker. */
+    }
+  };
+
+  /**
+   * A LoRA moves while its handle is held: when the pointer comes onto
+   * another row, the LoRA takes that row's position. Pointer events do this,
+   * because the window takes the browser's own drag and drop for files.
+   */
+  const startDrag = (event: PointerEvent<HTMLButtonElement>, index: number) => {
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragFrom.current = index;
+    setDragging(index);
+  };
+
+  const moveDrag = (event: PointerEvent<HTMLButtonElement>) => {
+    const from = dragFrom.current;
+    if (from === null || !loraList.current) return;
+    const to = [...loraList.current.children].findIndex((row) => {
+      const box = row.getBoundingClientRect();
+      return event.clientY >= box.top && event.clientY < box.bottom;
+    });
+    if (to < 0 || to === from) return;
+    dragFrom.current = to;
+    setDragging(to);
+    setFiles((current) => {
+      if (!current) return current;
+      const loras = [...current.loras];
+      const [moved] = loras.splice(from, 1);
+      loras.splice(to, 0, moved);
+      return { ...current, loras };
+    });
+  };
+
+  const endDrag = () => {
+    dragFrom.current = null;
+    setDragging(null);
   };
 
   const copyFromImageSage = async () => {
@@ -127,6 +197,7 @@ export function SettingsDialog({ onClose }: Props) {
   };
 
   return (
+    <>
     <div className="dialog-overlay" role="presentation" onPointerDown={() => !download && onClose()}>
       <div className="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title" onPointerDown={(event) => event.stopPropagation()}>
         <header className="dialog-header">
@@ -183,23 +254,49 @@ export function SettingsDialog({ onClose }: Props) {
           </section>
 
           <section className="settings-section">
-            <h3>LoRAs (optional)</h3>
-            {files && LORA_ROWS.map((row) => (
-              <label className="file-row with-strength" key={row.key}>
-                <span>{row.label}</span>
-                <input type="text" value={files[row.key]} spellCheck={false} onChange={(event) => change({ [row.key]: event.target.value })} placeholder="None" />
-                <input
-                  type="number"
-                  min={0}
-                  max={2}
-                  step={0.05}
-                  value={files[row.strength]}
-                  title="Strength: 1 is full strength, 0 turns the LoRA off"
-                  onChange={(event) => change({ [row.strength]: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 0 })}
-                />
-                <button className="button secondary small" onClick={() => void browse(row.key)} aria-label={`Choose the ${row.label}`}><FolderOpen size={15} /></button>
-              </label>
-            ))}
+            <div className="settings-heading">
+              <h3>LoRAs (optional)</h3>
+              <button className="button secondary small" onClick={() => setAdding(true)} disabled={!files}><Plus size={14} weight="bold" /> Add LoRA</button>
+            </div>
+            {files && files.loras.length === 0 && <div className="settings-line">No LoRA. Every clip uses the models as they are.</div>}
+            {files && files.loras.length > 0 && (
+              <div className="lora-list" ref={loraList}>
+                {files.loras.map((pair, index) => (
+                  <div className={`lora-row${dragging === index ? " dragging" : ""}`} key={index}>
+                    <button
+                      className="lora-grip"
+                      title="Drag to change the sequence"
+                      aria-label="Drag to change the sequence"
+                      onPointerDown={(event) => startDrag(event, index)}
+                      onPointerMove={moveDrag}
+                      onPointerUp={endDrag}
+                      onPointerCancel={endDrag}
+                    >
+                      <DotsSixVertical size={16} weight="bold" />
+                    </button>
+                    <div className="lora-files">
+                      {LORA_SIDES.map((side) => (
+                        <div className="lora-file" key={side.file}>
+                          <b>{side.label}</b>
+                          <span className={pair[side.file] ? "" : "none"} title={pair[side.file]}>{pair[side.file] ? baseName(pair[side.file]) : "None"}</span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={2}
+                            step={0.05}
+                            value={pair[side.strength]}
+                            disabled={!pair[side.file]}
+                            title="Strength: 1 is full strength, 0 turns the file off"
+                            onChange={(event) => changeLora(index, { [side.strength]: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 0 })}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    <button className="button secondary small" onClick={() => removeLora(index)} aria-label="Remove this LoRA" title="Remove this LoRA"><Trash size={15} /></button>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
 
           <section className="settings-section">
@@ -226,5 +323,7 @@ export function SettingsDialog({ onClose }: Props) {
         </footer>
       </div>
     </div>
+    {adding && <LoraDialog folder={loraFolder} onFolder={(folder) => void rememberLoraFolder(folder)} onAdd={addLora} onClose={() => setAdding(false)} />}
+    </>
   );
 }

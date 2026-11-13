@@ -226,6 +226,8 @@ textarea { width: 100%; resize: vertical; line-height: 1.45; }
 }
 .layer-thumb img { width: 100%; height: 100%; object-fit: contain; }
 .layer-text { flex: 1; min-width: 0; }
+.layer-remove { width: 28px; height: 28px; flex: 0 0 auto; display: grid; place-items: center; padding: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; }
+.layer-remove:hover { color: #f4f4f5; background: rgba(255,255,255,.08); }
 .layer-name { display: flex; align-items: center; gap: 7px; overflow: hidden; color: #eceef2; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; }
 .layer-name b { min-width: 20px; padding: 1px 5px; border-radius: 4px; color: var(--muted); background: #343844; font-size: 11px; font-weight: 700; text-align: center; }
 .layer-hidden { display: inline-flex; color: var(--muted); }
@@ -346,6 +348,21 @@ textarea { width: 100%; resize: vertical; line-height: 1.45; }
 .file-row.with-strength { grid-template-columns: 124px 1fr 70px auto; }
 .file-row > span { color: var(--muted); font-size: 12px; }
 .file-row input[type="text"] { font-size: 12px; }
+
+/* The LoRA list: one row for the two files of a LoRA */
+.lora-list { display: grid; gap: 6px; }
+.lora-row { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 8px; padding: 6px 8px 6px 4px; border: 1px solid var(--border); border-radius: 7px; background: var(--panel-raised); }
+.lora-row.dragging { border-color: var(--accent); background: #353a49; }
+.lora-grip { height: 100%; display: grid; place-items: center; padding: 0; color: var(--muted); background: transparent; cursor: grab; touch-action: none; }
+.lora-grip:hover, .lora-row.dragging .lora-grip { color: #eceef2; }
+.lora-row.dragging .lora-grip { cursor: grabbing; }
+.lora-files { min-width: 0; display: grid; gap: 4px; }
+.lora-file { display: grid; grid-template-columns: 34px 1fr 70px; align-items: center; gap: 8px; font-size: 12px; }
+.lora-file b { color: var(--muted); font-weight: 600; }
+.lora-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lora-file span.none { color: var(--muted); }
+.dialog.lora-dialog { width: min(620px, 100%); }
+.lora-help { color: #c8cbd3; font-size: 12px; line-height: 1.5; }
 
 /* About */
 .about-dialog-close { position: absolute; z-index: 2; top: 12px; right: 12px; }

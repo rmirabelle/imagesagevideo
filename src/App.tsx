@@ -11,7 +11,8 @@ import {
   Play,
   Plus,
   Trash,
-  WarningCircle
+  WarningCircle,
+  X
 } from "@phosphor-icons/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { AboutDialog } from "./components/AboutDialog";
@@ -68,6 +69,8 @@ export default function App() {
   const [info, setInfo] = useState<DocumentInfo | null>(null);
   const [opening, setOpening] = useState(false);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
+  /* The layers the user removed from the list. The document does not change, and they come back when it is opened again. */
+  const [removed, setRemoved] = useState<Set<string>>(new Set());
   const [outputDir, setOutputDir] = useState("");
   const [clipsPerLayer, setClipsPerLayer] = useState(2);
   const [missing, setMissing] = useState<string[]>([]);
@@ -89,6 +92,7 @@ export default function App() {
     try {
       const opened = await openDocument(path);
       setInfo(opened);
+      setRemoved(new Set());
       if (selectAll) setChosen(new Set(opened.layers.map((layer) => layer.tile)));
     } catch (error) {
       setMessage(String(error));
@@ -161,7 +165,7 @@ export default function App() {
       await queueClear();
       setPreview(null);
       setMessage(null);
-      if (info) setChosen(new Set(info.layers.map((layer) => layer.tile)));
+      if (info) setChosen(new Set(info.layers.filter((layer) => !removed.has(layer.tile)).map((layer) => layer.tile)));
     } catch (error) {
       setMessage(String(error));
     }
@@ -188,13 +192,24 @@ export default function App() {
     return next;
   });
 
+  const removeLayer = (tile: string) => {
+    setRemoved((current) => new Set(current).add(tile));
+    setChosen((current) => {
+      const next = new Set(current);
+      next.delete(tile);
+      return next;
+    });
+  };
+
+  const listedLayers = (info?.layers ?? []).filter((layer) => !removed.has(layer.tile));
+
   const thumbnails = useMemo(() => new Map(info?.layers.map((layer) => [layer.tile, layer.thumbnail]) ?? []), [info]);
   const hiddenTiles = useMemo(() => new Set(info?.layers.filter((layer) => layer.hidden).map((layer) => layer.tile) ?? []), [info]);
 
   /* The rows: during a job, the job's layers; before it, the document's layers. Both lists have the bottom layer first; the list shows the top layer first, as Image Sage does. */
   const rows = job
     ? job.layers.filter((layer) => layer.clips.some((clip) => !clip.cleared)).map((layer) => ({ tile: layer.tile, number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips as Clip[] | null, video: layer.video }))
-    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: layer.prompt, clips: null as Clip[] | null, video: null as string | null }));
+    : (info?.layers ?? []).map((layer, index) => ({ tile: layer.tile, number: index + 1, name: layer.name, prompt: layer.prompt, clips: null as Clip[] | null, video: null as string | null })).filter((row) => !removed.has(row.tile));
   const shownRows = [...rows].reverse();
   /* The clips in the list. While the clips are joined, all of them are done and the list must not become empty. */
   const listedClips = rows.flatMap((row) => row.clips ?? []).filter((clip) => !clip.cleared);
@@ -277,15 +292,16 @@ export default function App() {
 
       <main className="workspace">
         <div className="layers">
-          {!job && info && info.layers.length > 1 && (
+          {!job && info && (info.layers.length > 1 || removed.size > 0) && (
             <div className="layers-toolbar">
-              <span>{chosen.size} of {info.layers.length} layers</span>
-              <button className="link-button" onClick={() => setChosen(new Set(info.layers.map((layer) => layer.tile)))}>All</button>
+              <span>{chosen.size} of {listedLayers.length} layers</span>
+              {removed.size > 0 && <button className="link-button" onClick={() => setRemoved(new Set())} title="Show the layers that you removed from the list">Show removed ({removed.size})</button>}
+              <button className="link-button" onClick={() => setChosen(new Set(listedLayers.map((layer) => layer.tile)))}>All</button>
               <button className="link-button" onClick={() => setChosen(new Set())}>None</button>
             </div>
           )}
           <div className="layers-list">
-            {shownRows.length === 0 && (
+            {shownRows.length === 0 && !(info && removed.size > 0) && (
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
                 <p>Open an Image Sage document.</p>
@@ -328,6 +344,16 @@ export default function App() {
                         />
                       ))}
                     </div>
+                  )}
+                  {!job && (
+                    <button
+                      className="layer-remove"
+                      title="Remove this layer from the list. The document does not change."
+                      aria-label={`Remove ${row.name} from the list`}
+                      onClick={(event) => { event.stopPropagation(); removeLayer(row.tile); }}
+                    >
+                      <X size={15} />
+                    </button>
                   )}
                 </div>
               );

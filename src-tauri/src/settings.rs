@@ -21,11 +21,18 @@ pub struct Settings {
     pub output_dir: String,
     /// How many 5-second clips each layer's video had in the last job.
     pub clips_per_layer: usize,
+    /// The folder the last LoRA file was chosen from; the file browser opens there.
+    pub lora_folder: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { files: ModelFiles::default(), output_dir: String::new(), clips_per_layer: crate::queue::DEFAULT_CLIPS_PER_LAYER }
+        Self {
+            files: ModelFiles::default(),
+            output_dir: String::new(),
+            clips_per_layer: crate::queue::DEFAULT_CLIPS_PER_LAYER,
+            lora_folder: String::new(),
+        }
     }
 }
 

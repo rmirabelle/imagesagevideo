@@ -75,10 +75,16 @@ export interface ModelFiles {
   textEncoder: string;
   vae: string;
   negativePrompt: string;
-  lora: string;
-  loraStrength: number;
-  highNoiseLora: string;
-  highNoiseLoraStrength: number;
+  /** The LoRAs of every clip, in the sequence the engine gets them. */
+  loras: LoraPair[];
+}
+
+/** One LoRA for the two Wan 2.2 models: a file for each model, with its strength. An empty file means none for that model. */
+export interface LoraPair {
+  highNoise: string;
+  highNoiseStrength: number;
+  lowNoise: string;
+  lowNoiseStrength: number;
 }
 
 export interface Settings {
@@ -86,6 +92,8 @@ export interface Settings {
   outputDir: string;
   /** How many 5-second clips each layer's video had in the last job. */
   clipsPerLayer: number;
+  /** The folder the last LoRA file was chosen from. */
+  loraFolder: string;
 }
 
 export interface SettingsView {
@@ -132,3 +140,6 @@ export const takePendingOpenDocument = () => invoke<string | null>("take_pending
 
 /** The last part of a path: the file's or the folder's name. */
 export const baseName = (path: string) => path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? path;
+
+/** The folder that holds a file. */
+export const folderOf = (path: string) => path.replace(/[\\/][^\\/]*$/, "");

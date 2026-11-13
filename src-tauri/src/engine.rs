@@ -72,9 +72,29 @@ pub const DEFAULT_NEGATIVE_PROMPT: &str = "oversaturated colors, overexposed, st
      worst quality, low quality, jpeg artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, \
      malformed limbs, fused fingers, motionless frame, cluttered background, three legs, many people in the background, walking backwards";
 
-/// Wan 2.2 image-to-video's files and clip settings. The field names are the ones Image Sage saves, so its settings can be copied.
+/**
+ * One LoRA for the two Wan 2.2 models: a file for each model, with its
+ * strength. An empty file means no LoRA for that model. A strength of 1 is
+ * full strength, and 0 turns the file off.
+ */
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase", default)]
+pub struct LoraPair {
+    pub high_noise: String,
+    pub high_noise_strength: f64,
+    pub low_noise: String,
+    pub low_noise_strength: f64,
+}
+
+impl Default for LoraPair {
+    fn default() -> Self {
+        Self { high_noise: String::new(), high_noise_strength: 1.0, low_noise: String::new(), low_noise_strength: 1.0 }
+    }
+}
+
+/// Wan 2.2 image-to-video's files and clip settings.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "camelCase", from = "SavedModelFiles")]
 pub struct ModelFiles {
     /// The low-noise model: it finishes the clip that the high-noise model starts.
     pub diffusion_model: String,
@@ -84,13 +104,8 @@ pub struct ModelFiles {
     pub vae: String,
     /// What every clip avoids.
     pub negative_prompt: String,
-    /// An optional LoRA file for the low-noise model; empty means none.
-    pub lora: String,
-    /// How strongly the LoRA applies: 1 is full strength, 0 turns it off.
-    pub lora_strength: f64,
-    /// An optional LoRA file for the high-noise model; empty means none.
-    pub high_noise_lora: String,
-    pub high_noise_lora_strength: f64,
+    /// The LoRAs of every clip, in the sequence the engine gets them.
+    pub loras: Vec<LoraPair>,
 }
 
 impl Default for ModelFiles {
@@ -101,10 +116,66 @@ impl Default for ModelFiles {
             text_encoder: String::new(),
             vae: String::new(),
             negative_prompt: DEFAULT_NEGATIVE_PROMPT.into(),
+            loras: Vec::new(),
+        }
+    }
+}
+
+/**
+ * The model files as a file holds them. Image Sage, and this app before the
+ * LoRA list, save one LoRA for each model in four fields; those become the
+ * list's first pair.
+ */
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SavedModelFiles {
+    diffusion_model: String,
+    high_noise_model: String,
+    text_encoder: String,
+    vae: String,
+    negative_prompt: String,
+    loras: Vec<LoraPair>,
+    lora: String,
+    lora_strength: f64,
+    high_noise_lora: String,
+    high_noise_lora_strength: f64,
+}
+
+impl Default for SavedModelFiles {
+    fn default() -> Self {
+        Self {
+            diffusion_model: String::new(),
+            high_noise_model: String::new(),
+            text_encoder: String::new(),
+            vae: String::new(),
+            negative_prompt: DEFAULT_NEGATIVE_PROMPT.into(),
+            loras: Vec::new(),
             lora: String::new(),
             lora_strength: 1.0,
             high_noise_lora: String::new(),
             high_noise_lora_strength: 1.0,
+        }
+    }
+}
+
+impl From<SavedModelFiles> for ModelFiles {
+    fn from(saved: SavedModelFiles) -> Self {
+        let mut loras = saved.loras;
+        if loras.is_empty() && !(saved.lora.trim().is_empty() && saved.high_noise_lora.trim().is_empty()) {
+            loras.push(LoraPair {
+                high_noise: saved.high_noise_lora,
+                high_noise_strength: saved.high_noise_lora_strength,
+                low_noise: saved.lora,
+                low_noise_strength: saved.lora_strength,
+            });
+        }
+        Self {
+            diffusion_model: saved.diffusion_model,
+            high_noise_model: saved.high_noise_model,
+            text_encoder: saved.text_encoder,
+            vae: saved.vae,
+            negative_prompt: saved.negative_prompt,
+            loras,
         }
     }
 }
@@ -123,10 +194,10 @@ impl ModelFiles {
         .map(|(_, name)| name)
         .collect();
         let lost = |path: &str| !path.trim().is_empty() && !Path::new(path.trim()).is_file();
-        if lost(&self.lora) {
+        if self.loras.iter().any(|pair| lost(&pair.low_noise)) {
             missing.push("low-noise LoRA");
         }
-        if lost(&self.high_noise_lora) {
+        if self.loras.iter().any(|pair| lost(&pair.high_noise)) {
             missing.push("high-noise LoRA");
         }
         missing
@@ -134,12 +205,14 @@ impl ModelFiles {
 
     /**
      * The folder the engine reads LoRAs from, when a LoRA is set. The engine
-     * has one LoRA folder: for two LoRAs in different folders, it is the
-     * nearest folder that holds both.
+     * has one LoRA folder: for LoRAs in different folders, it is the
+     * nearest folder that holds them all.
      */
     fn lora_dir(&self) -> Option<PathBuf> {
-        let folders: Vec<&Path> = [&self.lora, &self.high_noise_lora]
-            .into_iter()
+        let folders: Vec<&Path> = self
+            .loras
+            .iter()
+            .flat_map(|pair| [&pair.low_noise, &pair.high_noise])
             .filter(|path| !path.trim().is_empty())
             .filter_map(|path| Path::new(path.trim()).parent())
             .collect();
@@ -156,10 +229,11 @@ impl ModelFiles {
         Some(inside.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
     }
 
-    /// The LoRA list of a job: the low-noise model's LoRA, then the high-noise model's. A LoRA of strength 0 is left out.
+    /// The LoRA list of a job: for each pair in sequence, the low-noise model's file, then the high-noise model's. A file of strength 0 is left out.
     fn job_loras(&self) -> Vec<Value> {
-        [(&self.lora, self.lora_strength, false), (&self.high_noise_lora, self.high_noise_lora_strength, true)]
-            .into_iter()
+        self.loras
+            .iter()
+            .flat_map(|pair| [(&pair.low_noise, pair.low_noise_strength, false), (&pair.high_noise, pair.high_noise_strength, true)])
             .filter(|(_, strength, _)| *strength != 0.0)
             .filter_map(|(lora, strength, high_noise)| {
                 let name = self.lora_name(lora)?;
@@ -837,17 +911,36 @@ mod tests {
 
     #[test]
     fn a_clip_job_has_a_lora_for_each_wan_model() {
-        let files = ModelFiles {
-            lora: "D:\\models\\loras\\wan\\Motion_Low.safetensors".into(),
-            high_noise_lora: "D:\\models\\loras\\wan\\Motion_High.safetensors".into(),
-            high_noise_lora_strength: 0.5,
-            ..ModelFiles::default()
+        let motion = LoraPair {
+            low_noise: "D:\\models\\loras\\wan\\Motion_Low.safetensors".into(),
+            high_noise: "D:\\models\\loras\\wan\\Motion_High.safetensors".into(),
+            high_noise_strength: 0.5,
+            ..LoraPair::default()
         };
+        let speed = LoraPair { low_noise: "D:\\models\\loras\\speed\\Fast_Low.safetensors".into(), ..LoraPair::default() };
+        let files = ModelFiles { loras: vec![motion.clone()], ..ModelFiles::default() };
         let body = video_body("x", 832, 464, &files, "data:image/png;base64,AAAA");
         assert_eq!(body["lora"][0], json!({ "path": "Motion_Low.safetensors", "multiplier": 1.0 }));
         assert_eq!(body["lora"][1], json!({ "path": "Motion_High.safetensors", "multiplier": 0.5, "is_high_noise": true }));
-        let off = ModelFiles { lora_strength: 0.0, high_noise_lora_strength: 0.0, ..files };
+
+        let two = ModelFiles { loras: vec![speed, motion.clone()], ..ModelFiles::default() };
+        let body = video_body("x", 832, 464, &two, "data:image/png;base64,AAAA");
+        assert_eq!(body["lora"][0], json!({ "path": "speed/Fast_Low.safetensors", "multiplier": 1.0 }));
+        assert_eq!(body["lora"][1], json!({ "path": "wan/Motion_Low.safetensors", "multiplier": 1.0 }));
+        assert_eq!(body["lora"][2], json!({ "path": "wan/Motion_High.safetensors", "multiplier": 0.5, "is_high_noise": true }));
+
+        let off = ModelFiles { loras: vec![LoraPair { low_noise_strength: 0.0, high_noise_strength: 0.0, ..motion }], ..ModelFiles::default() };
         assert!(video_body("x", 832, 464, &off, "data:image/png;base64,AAAA").get("lora").is_none());
+    }
+
+    #[test]
+    fn one_saved_lora_for_each_model_becomes_the_first_pair() {
+        let saved = json!({ "lora": "D:\\l\\low.safetensors", "loraStrength": 0.8, "highNoiseLora": "D:\\l\\high.safetensors" });
+        let files: ModelFiles = serde_json::from_value(saved).unwrap();
+        let pair = LoraPair { low_noise: "D:\\l\\low.safetensors".into(), low_noise_strength: 0.8, high_noise: "D:\\l\\high.safetensors".into(), high_noise_strength: 1.0 };
+        assert_eq!(files.loras, vec![pair]);
+        let again: ModelFiles = serde_json::from_value(serde_json::to_value(&files).unwrap()).unwrap();
+        assert_eq!(again, files);
     }
 
     #[test]
@@ -865,6 +958,7 @@ mod tests {
         let files: ModelFiles = serde_json::from_value(saved).unwrap();
         assert_eq!(files.high_noise_model, "D:\\m\\high.safetensors");
         assert_eq!(files.negative_prompt, "static");
+        assert!(files.loras.is_empty());
     }
 
     #[test]
