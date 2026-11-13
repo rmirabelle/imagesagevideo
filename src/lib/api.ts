@@ -128,6 +128,10 @@ export const queuePause = () => invoke<void>("queue_pause");
 export const queueResume = () => invoke<void>("queue_resume");
 export const queueClear = () => invoke<void>("queue_clear");
 export const queueClearDone = () => invoke<void>("queue_clear_done");
+/** Changes a layer's prompt in the job. The clips of that layer that start after this use it. */
+export const queueSetPrompt = (tile: string, prompt: string) => invoke<void>("queue_set_prompt", { tile, prompt });
+/** Stops the clip in work and removes it from its layer; the job goes on with the next clip. */
+export const queueCancelClip = () => invoke<void>("queue_cancel_clip");
 export const settingsGet =() => invoke<SettingsView>("settings_get");
 export const settingsSet = (settings: Settings) => invoke<void>("settings_set", { settings });
 export const settingsFromImageSage = () => invoke<ModelFiles>("settings_from_image_sage");

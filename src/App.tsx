@@ -26,7 +26,9 @@ import {
   openDocument,
   playVideo,
   queueClear,
+  queueCancelClip,
   queueClearDone,
+  queueSetPrompt,
   queueGet,
   queuePause,
   queueResume,
@@ -255,6 +257,12 @@ export default function App() {
     });
   };
 
+  /* Before a job, the window keeps the prompt. In a job, the job gets it at once. */
+  const keepPrompt = (tile: string, text: string) => {
+    if (!job) setPrompt(tile, text);
+    else if (text.trim() !== job.layers.find((layer) => layer.tile === tile)?.prompt) void queueSetPrompt(tile, text).catch((error) => setMessage(String(error)));
+  };
+
   const toggle = (tile: string) => setChosen((current) => {
     const next = new Set(current);
     if (next.has(tile)) next.delete(tile);
@@ -287,6 +295,8 @@ export default function App() {
   const doneClips = listedClips.filter((clip) => clip.status === "done").length;
   const canClearDone = doneClips > 0 && !(running && doneClips === listedClips.length);
 
+  /* A cancelled clip makes its layer shorter, so the job shows its longest layer. */
+  const shownClipsPerLayer = job ? Math.max(1, ...job.layers.map((layer) => layer.clips.length)) : clipsPerLayer;
   const clipSize = job ? `${job.clipWidth} × ${job.clipHeight}` : info?.clipWidth ? `${info.clipWidth} × ${info.clipHeight}` : null;
   const overall = snapshot.clipsTotal
     ? (snapshot.clipsDone + snapshot.clipsFailed + (running && snapshot.current && snapshot.current.stage !== "joining" ? snapshot.current.progress : 0)) / snapshot.clipsTotal
@@ -354,11 +364,11 @@ export default function App() {
               type="number"
               min={1}
               max={MAX_CLIPS_PER_LAYER}
-              value={job ? (job.layers[0]?.clips.length ?? clipsPerLayer) : clipsPerLayer}
+              value={shownClipsPerLayer}
               disabled={!!job}
               onChange={(event) => setClipsPerLayer(Math.min(MAX_CLIPS_PER_LAYER, Math.max(1, Math.round(Number(event.target.value)) || 1)))}
             />
-            <span>= one video of {(job ? (job.layers[0]?.clips.length ?? clipsPerLayer) : clipsPerLayer) * CLIP_SECONDS} seconds for each layer</span>
+            <span>= one video of {(shownClipsPerLayer) * CLIP_SECONDS} seconds for each layer</span>
           </div>
         </div>
       </section>
@@ -391,6 +401,8 @@ export default function App() {
             )}
             {shownRows.map((row) => {
               const jobLayer = job ? job.layers.findIndex((layer) => layer.tile === row.tile) : -1;
+              /* Before a job, each prompt can change. In a job, a prompt can change while the layer has a clip that did not start yet. */
+              const canEdit = !job || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
               return (
                 <div className={`layer-row ${!job && !chosen.has(row.tile) ? "off" : ""}`} key={row.tile} onClick={() => !job && toggle(row.tile)}>
                   {!job && <input type="checkbox" checked={chosen.has(row.tile)} onChange={() => toggle(row.tile)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
@@ -406,7 +418,7 @@ export default function App() {
                       <b>{row.number}</b> {row.name}
                       {hiddenTiles.has(row.tile) && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
                     </div>
-                    {!job && editing === row.tile ? (
+                    {canEdit && editing === row.tile ? (
                       <div className="layer-prompt-edit" onClick={(event) => event.stopPropagation()}>
                         <textarea
                           rows={3}
@@ -417,7 +429,7 @@ export default function App() {
                           aria-label={`The prompt of ${row.name}`}
                           onFocus={(event) => { editCancelled.current = false; event.currentTarget.select(); }}
                           onBlur={(event) => {
-                            if (!editCancelled.current) setPrompt(row.tile, event.currentTarget.value);
+                            if (!editCancelled.current) keepPrompt(row.tile, event.currentTarget.value);
                             editCancelled.current = false;
                             setEditing(null);
                           }}
@@ -427,8 +439,8 @@ export default function App() {
                           }}
                         />
                         <small>
-                          Enter keeps the prompt. Esc cancels. The document does not change.
-                          {prompts.has(row.tile) && (
+                          Enter keeps the prompt. Esc cancels. {job ? "The clips of this layer that start after this use the new prompt." : "The document does not change."}
+                          {!job && prompts.has(row.tile) && (
                             <button
                               className="link-button"
                               onMouseDown={(event) => event.preventDefault()}
@@ -470,10 +482,10 @@ export default function App() {
                       ))}
                     </div>
                   )}
-                  {!job && (
+                  {canEdit && (
                     <button
                       className="layer-remove"
-                      title="Change this layer's prompt for the video. The document does not change."
+                      title={job ? "Change this layer's prompt. The clips of this layer that start after this use the new prompt." : "Change this layer's prompt for the video. The document does not change."}
                       aria-label={`Change the prompt of ${row.name}`}
                       onClick={(event) => { event.stopPropagation(); setEditing(row.tile); }}
                     >
@@ -536,6 +548,16 @@ export default function App() {
           {job && running && (
             <button className="button primary large" onClick={() => void queuePause()} title="Stop the clip in work and remove the model from the GPU memory. Resume makes that clip again from its start.">
               <Pause size={16} weight="fill" /> Pause
+            </button>
+          )}
+          {job && running && (
+            <button
+              className="button secondary large"
+              onClick={() => void queueCancelClip().catch((error) => setMessage(String(error)))}
+              disabled={!snapshot.current || snapshot.current.stage === "joining"}
+              title="Stop the clip in work and do not make it. The layer's video gets one clip less, and the job goes on with the next clip. The model stays in the GPU memory."
+            >
+              <X size={16} /> Cancel Clip
             </button>
           )}
           {job && snapshot.state === "paused" && (

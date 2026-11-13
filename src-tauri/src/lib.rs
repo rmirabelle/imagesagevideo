@@ -117,6 +117,8 @@ pub fn run() {
             queue::queue_resume,
             queue::queue_clear,
             queue::queue_clear_done,
+            queue::queue_set_prompt,
+            queue::queue_cancel_clip,
             take_pending_open_document,
             hide_to_tray,
             quit_app,

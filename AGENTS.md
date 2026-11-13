@@ -29,6 +29,10 @@
 - A runner may change the job only through `queue::update`, which checks the
   runner's generation. Pause, a new start and clear raise the generation, so
   a runner that was stopped cannot write stale state.
+- Cancel Clip (`queue_cancel_clip`) removes the clip in work from its layer and
+  starts a new runner; the engine stays loaded. A prompt change in a job
+  (`queue_set_prompt`) does not raise the generation; the clips that start
+  after it use the new prompt.
 - `src-tauri/src/engine.rs` runs stable-diffusion.cpp's `sd-server.exe` with
   Wan 2.2 image-to-video. Its start flags, job request and pinned engine build
   must stay the same as Image Sage's `src-tauri/src/local.rs`

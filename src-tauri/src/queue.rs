@@ -113,6 +113,21 @@ impl Job {
      * the places of the other clips do not change and the layer's video
      * still has it. Returns how many clips it removed.
      */
+    /**
+     * Removes the clip that is in work from its layer, so the layer's video
+     * has one clip less. The clips after it move one place down; the next
+     * one then continues the last done clip. Returns false when no clip is
+     * in work at that place.
+     */
+    fn skip_running(&mut self, layer: usize, clip: usize) -> bool {
+        let Some(clips) = self.layers.get_mut(layer).map(|layer| &mut layer.clips) else { return false };
+        if clips.get(clip).is_none_or(|clip| clip.status != ClipStatus::Running) {
+            return false;
+        }
+        clips.remove(clip);
+        true
+    }
+
     fn clear_done(&mut self) -> usize {
         let mut removed = 0;
         for clip in self.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
@@ -484,6 +499,64 @@ pub fn queue_clear_done(app: AppHandle, queue: State<'_, Queue>) {
     publish(&app, &inner);
 }
 
+/**
+ * Stops the clip in work and removes it from its layer; the job then goes
+ * on with the next clip. The engine stays loaded: when the stopped runner
+ * is dropped, it tells the engine to cancel that clip. A new runner starts,
+ * so the stopped one cannot write stale state. When no clip is left in the
+ * list, the job itself is removed.
+ */
+#[tauri::command]
+pub fn queue_cancel_clip(app: AppHandle, queue: State<'_, Queue>, engine: State<'_, Engine>) -> Result<(), String> {
+    let mut inner = queue.lock();
+    let place = inner.current.as_ref().filter(|current| current.stage != "joining").map(|current| (current.layer, current.clip));
+    let skipped = inner.state == RunState::Running
+        && place.is_some_and(|(layer, clip)| inner.job.as_mut().is_some_and(|job| job.skip_running(layer, clip)));
+    if !skipped {
+        return Err("No clip is in work now.".into());
+    }
+    inner.generation += 1;
+    if let Some(task) = inner.task.take() {
+        task.abort();
+    }
+    if inner.job.as_ref().is_some_and(|job| job.listed().next().is_none()) {
+        inner.job = None;
+        inner.state = RunState::Idle;
+        inner.current = None;
+        inner.error = None;
+        save_job(&app, None);
+        publish(&app, &inner);
+        drop(inner);
+        engine.stop();
+        return Ok(());
+    }
+    spawn_runner(&app, &queue, &engine, &mut inner);
+    Ok(())
+}
+
+/**
+ * Changes a layer's prompt; the job can be running. The clip in work keeps
+ * the prompt it started with. Each clip of the layer that starts after
+ * this uses the new prompt. The runner goes on, so the generation does not
+ * change.
+ */
+#[tauri::command]
+pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, tile: String, prompt: String) -> Result<(), String> {
+    let mut inner = queue.lock();
+    let layer = inner
+        .job
+        .as_mut()
+        .and_then(|job| job.layers.iter_mut().find(|layer| layer.tile == tile))
+        .ok_or("The job does not have this layer.")?;
+    if layer.video.is_some() {
+        return Err("This layer's video is done, so its prompt cannot change.".into());
+    }
+    layer.prompt = prompt.trim().to_string();
+    save_job(&app, inner.job.as_ref());
+    publish(&app, &inner);
+    Ok(())
+}
+
 /// Changes the job as the runner with this generation. None when that runner was paused or replaced; it must then stop.
 fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change: impl FnOnce(&mut Inner) -> T) -> Option<T> {
     let mut inner = queue.lock();
@@ -502,6 +575,13 @@ fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change
 async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
     let mut picture: Option<(usize, String)> = None;
     let mut failures_in_a_row = 0_u32;
+    /* When the user cancelled a layer's last clip, the layer's other clips are all done and wait for the join. */
+    let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
+    for layer in 0..layers {
+        if join_layer(&app, &queue, generation, layer).await.is_none() {
+            return;
+        }
+    }
     loop {
         let next = update(&app, &queue, generation, true, |inner| {
             let job = inner.job.as_mut()?;
@@ -578,7 +658,7 @@ async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, layer: usiz
     let work = update(app, queue, generation, false, |inner| {
         let job = inner.job.as_ref()?;
         let layer_job = job.layers.get(layer)?;
-        if layer_job.video.is_some() || !layer_job.all_done() {
+        if layer_job.video.is_some() || layer_job.clips.is_empty() || !layer_job.all_done() {
             return None;
         }
         let files: Vec<String> = layer_job.clips.iter().filter_map(|clip| clip.file.clone()).collect();
@@ -729,6 +809,16 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_cancelled_clip_leaves_its_layer() {
+        let mut job = job(&[[ClipStatus::Done, ClipStatus::Running, ClipStatus::Pending]]);
+        assert!(!job.skip_running(0, 0));
+        assert!(!job.skip_running(1, 0));
+        assert!(job.skip_running(0, 1));
+        assert_eq!(job.layers[0].clips.len(), 2);
+        assert_eq!(job.next_pending(), Some((0, 1)));
     }
 
     #[test]
