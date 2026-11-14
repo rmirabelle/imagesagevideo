@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::{
     crypto, document,
     engine::{self, Engine, Step, VIDEO_STEPS},
-    last_frame, settings, tray, webm,
+    files, last_frame, settings, tray, webm,
 };
 
 /**
@@ -141,11 +141,6 @@ impl Job {
     }
 
     /**
-     * Removes each done clip from the list. The clip stays in the job, so
-     * the places of the other clips do not change and the layer's video
-     * still has it. Returns how many clips it removed.
-     */
-    /**
      * Removes the clip that is in work from its layer, so the layer's video
      * has one clip less. The clips after it move one place down; the next
      * one then continues the last done clip. Returns false when no clip is
@@ -160,6 +155,11 @@ impl Job {
         true
     }
 
+    /**
+     * Removes each done clip from the list. The clip stays in the job, so
+     * the places of the other clips do not change and the layer's video
+     * still has it. Returns how many clips it removed.
+     */
     fn clear_done(&mut self) -> usize {
         let mut removed = 0;
         for clip in self.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
@@ -171,6 +171,54 @@ impl Job {
         removed
     }
 
+    /// True when the file is a clip that is not joined into a video yet.
+    fn has_clip_file(&self, path: &str) -> bool {
+        self.layers.iter().flat_map(|layer| &layer.clips).any(|clip| clip.file.as_deref().is_some_and(|file| files::same_file(file, path)))
+    }
+
+    /// The layer that still needs this document or photo for its first clip.
+    fn layer_that_needs(&self, path: &str) -> Option<&LayerJob> {
+        self.layers.iter().find(|layer| {
+            files::same_file(&layer.document, path) && layer.video.is_none() && layer.clips.first().is_some_and(|clip| clip.status != ClipStatus::Done)
+        })
+    }
+
+    /**
+     * Gives the job the new path of a file that was renamed: a layer's
+     * document or photo, or a layer's video. A photo's layer has the
+     * photo's name, so it gets the new name. Returns false when the job
+     * does not use the file.
+     */
+    fn repath(&mut self, old: &str, new: &str) -> bool {
+        let stem = |path: &str| Path::new(path).file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut changed = false;
+        for layer in &mut self.layers {
+            if files::same_file(&layer.document, old) {
+                layer.document = new.to_string();
+                if layer.tile == document::PHOTO_TILE && layer.name == stem(old) {
+                    layer.name = stem(new);
+                }
+                changed = true;
+            }
+            if layer.video.as_deref().is_some_and(|video| files::same_file(video, old)) {
+                layer.video = Some(new.to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Removes from the list the layer whose video is this file. Returns false when no layer has this video.
+    fn forget_video(&mut self, path: &str) -> bool {
+        let mut changed = false;
+        for layer in self.layers.iter_mut().filter(|layer| layer.video.as_deref().is_some_and(|video| files::same_file(video, path))) {
+            for clip in &mut layer.clips {
+                clip.cleared = true;
+            }
+            changed = true;
+        }
+        changed
+    }
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
@@ -242,6 +290,17 @@ impl Inner {
             clips_done: self.job.as_ref().map_or(0, |job| job.count(ClipStatus::Done)),
             clips_failed: self.job.as_ref().map_or(0, |job| job.count(ClipStatus::Failed)),
             clips_total: self.job.as_ref().map_or(0, Job::total),
+        }
+    }
+
+    /// Removes a job that does not run and has no clip left in the list.
+    fn drop_empty_job(&mut self) {
+        if self.state != RunState::Running && self.job.as_ref().is_some_and(|job| job.listed().next().is_none()) {
+            self.generation += 1;
+            self.job = None;
+            self.state = RunState::Idle;
+            self.current = None;
+            self.error = None;
         }
     }
 }
@@ -546,13 +605,7 @@ pub fn queue_clear_done(app: AppHandle, queue: State<'_, Queue>) {
     if job.clear_done() == 0 {
         return;
     }
-    if job.listed().next().is_none() && inner.state != RunState::Running {
-        inner.generation += 1;
-        inner.job = None;
-        inner.state = RunState::Idle;
-        inner.current = None;
-        inner.error = None;
-    }
+    inner.drop_empty_job();
     save_job(&app, inner.job.as_ref());
     publish(&app, &inner);
 }
@@ -608,6 +661,73 @@ pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, p
     layer.prompt = prompt.trim().to_string();
     save_job(&app, inner.job.as_ref());
     publish(&app, &inner);
+    Ok(())
+}
+
+/**
+ * Renames a document, a photo or a finished video on the disk; the file
+ * stays in its folder and keeps its extension. A job that uses the file
+ * gets the new path, and the runner goes on, so the generation does not
+ * change. Returns the new path.
+ */
+#[tauri::command]
+pub fn file_rename(app: AppHandle, queue: State<'_, Queue>, path: String, name: String) -> Result<String, String> {
+    let old = files::managed_file(&path)?;
+    let new = files::renamed_path(&old, &name)?;
+    let (old_text, new_text) = (old.to_string_lossy().into_owned(), new.to_string_lossy().into_owned());
+    if new == old {
+        return Ok(old_text);
+    }
+    if new.exists() && !files::same_file(&old_text, &new_text) {
+        return Err(format!("{} exists already. Write a different name.", new.display()));
+    }
+    let mut inner = queue.lock();
+    let running = inner.state == RunState::Running;
+    if let Some(job) = inner.job.as_ref() {
+        if job.has_clip_file(&old_text) {
+            return Err("The job still uses this clip. Wait until the clips are joined.".into());
+        }
+        /* The runner has the old path while it makes a layer's first clip. */
+        let read_now = job.layers.iter().any(|layer| {
+            files::same_file(&layer.document, &old_text) && layer.clips.first().is_some_and(|clip| clip.status == ClipStatus::Running)
+        });
+        if running && read_now {
+            return Err("The job makes the first clip from this file now. Rename the file when that clip is done.".into());
+        }
+    }
+    std::fs::rename(&old, &new).map_err(|error| format!("Could not rename {}: {error}", old.display()))?;
+    if inner.job.as_mut().is_some_and(|job| job.repath(&old_text, &new_text)) {
+        save_job(&app, inner.job.as_ref());
+        publish(&app, &inner);
+    }
+    Ok(new_text)
+}
+
+/**
+ * Moves a document, a photo or a finished video to the Recycle Bin. A
+ * file that the job still needs for a layer's first clip stays. A deleted
+ * video's layer leaves the list; when no clip is left in a job that does
+ * not run, the job itself is removed.
+ */
+#[tauri::command]
+pub fn file_delete(app: AppHandle, queue: State<'_, Queue>, path: String) -> Result<(), String> {
+    let file = files::managed_file(&path)?;
+    let text = file.to_string_lossy().into_owned();
+    let mut inner = queue.lock();
+    if let Some(job) = inner.job.as_ref() {
+        if job.has_clip_file(&text) {
+            return Err("The job still uses this clip. Wait until the clips are joined.".into());
+        }
+        if let Some(layer) = job.layer_that_needs(&text) {
+            return Err(format!("The job needs this file for the first clip of \"{}\". Delete the file when that clip is done, or remove the job first.", layer.name));
+        }
+    }
+    files::recycle(&file)?;
+    if inner.job.as_mut().is_some_and(|job| job.forget_video(&text)) {
+        inner.drop_empty_job();
+        save_job(&app, inner.job.as_ref());
+        publish(&app, &inner);
+    }
     Ok(())
 }
 
@@ -895,6 +1015,29 @@ mod tests {
         job.layers[0].tile = document::PHOTO_TILE.into();
         job.layers[0].document = r"D:\Photos\Beach day.jpg".into();
         assert_eq!(job.layers[0].file_stem(), "Beach-day");
+    }
+
+    #[test]
+    fn a_renamed_or_deleted_file_changes_the_job() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Done, Done], [Pending, Pending, Pending]]);
+        job.layers[0].video = Some(r"D:\Out\fox.webm".into());
+        for clip in &mut job.layers[0].clips {
+            clip.file = None;
+        }
+        assert!(!job.repath(r"D:\Other\file.png", r"D:\Other\new.png"));
+        assert!(job.repath("d:/art/my fox (final).imagesage", r"D:\Art\Fox.imagesage"));
+        assert!(job.layers.iter().all(|layer| layer.document == r"D:\Art\Fox.imagesage"));
+        assert_eq!(job.layer_that_needs(r"D:\Art\Fox.imagesage").map(|layer| layer.index), Some(1));
+        assert!(job.repath(r"D:\Out\fox.webm", r"D:\Out\red fox.webm"));
+        assert_eq!(job.layers[0].video.as_deref(), Some(r"D:\Out\red fox.webm"));
+        assert!(!job.has_clip_file(r"D:\Out\red fox.webm"));
+        assert!(job.forget_video(r"d:\out\RED FOX.webm"));
+        assert_eq!(job.total(), 3);
+        job.layers[1].tile = document::PHOTO_TILE.into();
+        job.layers[1].name = "Fox".into();
+        assert!(job.repath(r"D:\Art\Fox.imagesage", r"D:\Art\Wolf.imagesage"));
+        assert_eq!(job.layers[1].name, "Wolf");
     }
 
     #[test]

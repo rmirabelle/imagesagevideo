@@ -5,6 +5,7 @@ import {
   CheckCircle,
   CircleNotch,
   EyeSlash,
+  File as FileIcon,
   FilmStrip,
   FolderOpen,
   Pause,
@@ -15,12 +16,14 @@ import {
   WarningCircle,
   X
 } from "@phosphor-icons/react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AboutDialog } from "./components/AboutDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
 import {
   baseName,
+  fileDelete,
+  fileRename,
   hideToTray,
   layerPicture,
   openDocument,
@@ -124,6 +127,10 @@ export default function App() {
   const editCancelled = useRef(false);
   /* The row whose large picture shows. The small picture shows first, until the large one is read. */
   const [zoom, setZoom] = useState<{ id: string; name: string; src: string } | null>(null);
+  /* The file whose name is in the text box now, by its file key. */
+  const [renaming, setRenaming] = useState<string | null>(null);
+  /* The file that the user asked to delete. The dialog asks before the file goes. */
+  const [deleting, setDeleting] = useState<{ path: string; video: boolean } | null>(null);
   const [outputDir, setOutputDir] = useState("");
   const [clipsPerLayer, setClipsPerLayer] = useState(2);
   const [missing, setMissing] = useState<string[]>([]);
@@ -287,6 +294,57 @@ export default function App() {
     }
   };
 
+  /**
+   * Renames a file on the disk. The job gets the new path from the Rust
+   * side. For a document or a photo, the window reads the file again and
+   * moves all that it keeps for the file's layers to the new path.
+   */
+  const renameFile = async (path: string, name: string) => {
+    try {
+      const renamed = await fileRename(path, name);
+      const [from, to] = [fileKey(path), fileKey(renamed)];
+      if (renamed === path || !known.has(from)) return;
+      const info = await openDocument(renamed);
+      const moved = (key: string) => (key.startsWith(`${from}|`) ? `${to}|${key.slice(from.length + 1)}` : key);
+      setKnown((current) => {
+        const next = new Map(current);
+        next.delete(from);
+        next.set(to, info);
+        return next;
+      });
+      setStaged((current) => current.map((file) => (file === from ? to : file)));
+      setChosen((current) => new Set([...current].map(moved)));
+      setRemoved((current) => new Set([...current].map(moved)));
+      setPrompts((current) => new Map([...current].map(([key, text]) => [moved(key), text])));
+      setEditing(null);
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  /* Moves a file to the Recycle Bin. A document or a photo leaves the files that wait; the Rust side removes a video's layer from the job's list. */
+  const deleteFile = async (path: string, video: boolean) => {
+    setDeleting(null);
+    try {
+      await fileDelete(path);
+      if (!video) unstage(new Set([fileKey(path)]));
+    } catch (error) {
+      setMessage(String(error));
+    }
+  };
+
+  /* The buttons of one file: show it in its folder, rename it, delete it. */
+  const fileActions = (path: string, video: boolean) => ({
+    path,
+    video,
+    renaming: renaming === fileKey(path),
+    onReveal: () => void revealPath(path).catch((error) => setMessage(String(error))),
+    onRenameStart: () => setRenaming(fileKey(path)),
+    onRename: (name: string) => void renameFile(path, name),
+    onRenameEnd: () => setRenaming(null),
+    onDelete: () => setDeleting({ path, video })
+  });
+
   const layerInfos = useMemo(() => {
     const infos = new Map<string, DocumentInfo["layers"][number]>();
     for (const info of known.values()) for (const layer of info.layers) infos.set(layerKey(info.path, layer.tile), layer);
@@ -357,7 +415,6 @@ export default function App() {
   })).filter((row) => row.clips.some((clip) => !clip.cleared));
   /* The layers that wait are first, so the user sees the files that were opened last. */
   const shownRows = [...topLayerFirst(stagedRows), ...topLayerFirst(jobRows)];
-  const manyFiles = new Set(shownRows.map((row) => fileKey(row.path))).size > 1;
   const chosenCount = stagedRows.filter((row) => chosen.has(row.key)).length;
   const hasRemoved = staged.length > 0 && removed.size > 0;
 
@@ -475,13 +532,18 @@ export default function App() {
                 <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here. You can open more files while a job runs.</span>
               </div>
             )}
-            {shownRows.map((row) => {
+            {shownRows.map((row, place) => {
               const waits = row.jobLayer < 0;
+              /* Each file's rows have the file's name above them. A file can be in the list two times: its layers that wait, and its layers in the job. */
+              const before = shownRows[place - 1];
+              const firstOfFile = !before || fileKey(before.path) !== fileKey(row.path) || (before.jobLayer < 0) !== waits;
               const info = layerInfos.get(row.key);
               /* A layer that waits can always get a new prompt. A job's layer can get one while it has a clip that did not start yet. */
               const canEdit = waits || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
               return (
-                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`} key={row.id} onClick={() => waits && toggle(row.key)}>
+                <Fragment key={row.id}>
+                {firstOfFile && <FileLine header {...fileActions(row.path, false)} />}
+                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`} onClick={() => waits && toggle(row.key)}>
                   {waits && <input type="checkbox" checked={chosen.has(row.key)} onChange={() => toggle(row.key)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
                   {info?.thumbnail ? (
                     <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row); }}>
@@ -494,7 +556,6 @@ export default function App() {
                     <div className="layer-name">
                       {row.tile !== PHOTO_TILE && <b>{row.number}</b>} {row.name}
                       {info?.hidden && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
-                      {manyFiles && row.tile !== PHOTO_TILE && <small className="layer-file" title={row.path}>{baseName(row.path)}</small>}
                     </div>
                     {canEdit && editing === row.id ? (
                       <div className="layer-prompt-edit" onClick={(event) => event.stopPropagation()}>
@@ -535,6 +596,7 @@ export default function App() {
                         {waits && prompts.has(row.key) && <em> (changed)</em>}
                       </div>
                     )}
+                    {row.video && <FileLine {...fileActions(row.video, true)} />}
                   </div>
                   {row.video && (
                     <div className="clips">
@@ -581,6 +643,7 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                </Fragment>
               );
             })}
           </div>
@@ -686,6 +749,25 @@ export default function App() {
           <img src={zoom.src} alt={zoom.name} />
         </div>
       )}
+      {deleting && (
+        <div className="dialog-overlay" role="presentation" onPointerDown={() => setDeleting(null)}>
+          <div className="dialog confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title" onPointerDown={(event) => event.stopPropagation()}>
+            <div className="dialog-body">
+              <h2 id="delete-title">Delete {baseName(deleting.path)}?</h2>
+              <p>
+                The file goes to the Recycle Bin. {deleting.video
+                  ? "The video leaves the list. Its document or photo does not change."
+                  : "Its layers that wait for Start leave the list. The finished videos do not change."}
+              </p>
+              <p className="dialog-path">{deleting.path}</p>
+            </div>
+            <footer className="dialog-footer">
+              <button className="button secondary" onClick={() => setDeleting(null)}>Cancel</button>
+              <button className="button primary" autoFocus onClick={() => void deleteFile(deleting.path, deleting.video)}>Delete</button>
+            </footer>
+          </div>
+        </div>
+      )}
       {closeAsked && (
         <div className="dialog-overlay" role="presentation" onPointerDown={() => setCloseAsked(false)}>
           <div className="dialog confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="close-title" onPointerDown={(event) => event.stopPropagation()}>
@@ -701,6 +783,74 @@ export default function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+interface FileLineProps {
+  path: string;
+  /** The file is a finished video; if not, it is a document or a photo. */
+  video: boolean;
+  /** The line is above a file's rows; if not, it is in a row. */
+  header?: boolean;
+  /** The file's name is in the text box now. */
+  renaming: boolean;
+  onReveal: () => void;
+  onRenameStart: () => void;
+  onRename: (name: string) => void;
+  onRenameEnd: () => void;
+  onDelete: () => void;
+}
+
+/**
+ * A file's name with its buttons: show the file in its folder, rename it,
+ * delete it. For a new name, the user writes the name without the
+ * extension. Enter or a click out of the box keeps the name; Esc cancels.
+ */
+function FileLine({ path, video, header, renaming, onReveal, onRenameStart, onRename, onRenameEnd, onDelete }: FileLineProps) {
+  const cancelled = useRef(false);
+  const name = baseName(path);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const extension = dot > 0 ? name.slice(dot) : "";
+  const kind = video ? "video" : "file";
+  return (
+    <div className={`file-line ${header ? "header" : ""} ${video ? "video" : ""}`} onClick={(event) => event.stopPropagation()}>
+      {video ? <FilmStrip size={13} /> : <FileIcon size={13} />}
+      {renaming ? (
+        <>
+          <input
+            type="text"
+            autoFocus
+            spellCheck={false}
+            defaultValue={stem}
+            aria-label={`The new name of ${name}`}
+            onFocus={(event) => { cancelled.current = false; event.currentTarget.select(); }}
+            onBlur={(event) => {
+              const next = event.currentTarget.value.trim();
+              if (!cancelled.current && next && next !== stem) onRename(next);
+              cancelled.current = false;
+              onRenameEnd();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") { cancelled.current = true; event.currentTarget.blur(); }
+              else if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
+            }}
+          />
+          <span className="file-extension">{extension}</span>
+        </>
+      ) : (
+        <span className="file-name" title={path}>{name}</span>
+      )}
+      <button className="file-action" title={`Show this ${kind} in its folder`} aria-label={`Show ${name} in its folder`} onClick={onReveal}>
+        <FolderOpen size={14} />
+      </button>
+      <button className="file-action" title={`Rename this ${kind} on the disk`} aria-label={`Rename ${name}`} onClick={onRenameStart}>
+        <PencilSimple size={14} />
+      </button>
+      <button className="file-action" title={`Delete this ${kind}: move it to the Recycle Bin`} aria-label={`Delete ${name}`} onClick={onDelete}>
+        <Trash size={14} />
+      </button>
     </div>
   );
 }

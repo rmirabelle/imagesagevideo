@@ -144,6 +144,10 @@ export const engineDownload = () => invoke<void>("engine_download");
 export const findModels = (folder: string) => invoke<FoundModels>("find_models", { folder });
 export const revealPath = (path: string) => invoke<void>("reveal_path", { path });
 export const playVideo = (path: string) => invoke<void>("play_video", { path });
+/** Renames a document, a photo or a finished video on the disk. The name has no extension; the file keeps its own. Returns the new path. */
+export const fileRename = (path: string, name: string) => invoke<string>("file_rename", { path, name });
+/** Moves a document, a photo or a finished video to the Recycle Bin. */
+export const fileDelete = (path: string) => invoke<void>("file_delete", { path });
 export const hideToTray = () => invoke<void>("hide_to_tray");
 export const quitApp = () => invoke<void>("quit_app");
 export const takePendingOpenDocument = () => invoke<string | null>("take_pending_open_document");

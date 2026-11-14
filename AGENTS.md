@@ -39,6 +39,12 @@
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start
   after it use the new prompt.
+- The list shows each file's name with buttons to show it in its folder,
+  rename it and delete it; a done layer has the same for its video.
+  `file_rename` and `file_delete` (`queue.rs`) accept only documents, photos
+  and videos, give the job a renamed file's new path, and do not raise the
+  generation. Delete moves the file to the Recycle Bin. A file that the job
+  still needs for a layer's first clip cannot be deleted.
 - `src-tauri/src/engine.rs` runs stable-diffusion.cpp's `sd-server.exe` with
   Wan 2.2 image-to-video. Its start flags, job request and pinned engine build
   must stay the same as Image Sage's `src-tauri/src/local.rs`
