@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { CheckCircle, CircleNotch, DotsSixVertical, DownloadSimple, FolderOpen, MagnifyingGlass, Plus, Trash, WarningCircle, X } from "@phosphor-icons/react";
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { LoraDialog } from "./LoraDialog";
+import { StrengthInput } from "./StrengthInput";
 import {
   baseName,
   engineDownload,
@@ -32,8 +33,8 @@ const MODEL_ROWS: { key: FileKey; label: string; help: string }[] = [
 ];
 
 const LORA_SIDES = [
-  { file: "highNoise", strength: "highNoiseStrength", label: "High" },
-  { file: "lowNoise", strength: "lowNoiseStrength", label: "Low" }
+  { file: "highNoise", strength: "highNoiseStrength", off: "highNoiseOff", label: "High", pass: "high-noise" },
+  { file: "lowNoise", strength: "lowNoiseStrength", off: "lowNoiseOff", label: "Low", pass: "low-noise" }
 ] as const;
 
 const MODEL_FILTER = [{ name: "Model files", extensions: ["safetensors", "gguf", "sft"] }];
@@ -276,18 +277,25 @@ export function SettingsDialog({ onClose }: Props) {
                     </button>
                     <div className="lora-files">
                       {LORA_SIDES.map((side) => (
-                        <div className="lora-file" key={side.file}>
+                        <div className={`lora-file${pair[side.file] && pair[side.off] ? " off" : ""}`} key={side.file}>
+                          <input
+                            type="checkbox"
+                            checked={!!pair[side.file] && !pair[side.off]}
+                            disabled={!pair[side.file]}
+                            title={!pair[side.file] ? `This LoRA has no file for the ${side.pass} pass`
+                              : pair[side.off] ? `This file is off: the ${side.pass} pass does not use it. Click to use it.`
+                              : `The ${side.pass} pass uses this file. Click to turn the file off; it stays in the list.`}
+                            aria-label={`Use this LoRA in the ${side.pass} pass`}
+                            onChange={(event) => changeLora(index, { [side.off]: !event.target.checked })}
+                          />
                           <b>{side.label}</b>
                           <span className={pair[side.file] ? "" : "none"} title={pair[side.file]}>{pair[side.file] ? baseName(pair[side.file]) : "None"}</span>
-                          <input
-                            type="number"
-                            min={0}
-                            max={2}
-                            step={0.05}
+                          <StrengthInput
                             value={pair[side.strength]}
                             disabled={!pair[side.file]}
-                            title="Strength: 1 is full strength, 0 turns the file off"
-                            onChange={(event) => changeLora(index, { [side.strength]: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 0 })}
+                            title="Strength, from 0 to 2: 1 is full strength"
+                            label={`The strength of this LoRA in the ${side.pass} pass`}
+                            onChange={(value) => changeLora(index, { [side.strength]: value })}
                           />
                         </div>
                       ))}

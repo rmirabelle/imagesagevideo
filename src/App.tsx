@@ -556,7 +556,7 @@ export default function App() {
               return (
                 <Fragment key={row.id}>
                 {firstOfFile && <FileLine header {...fileActions(row.path, false)} />}
-                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`} onClick={() => waits && toggle(row.key)}>
+                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`}>
                   {waits && <input type="checkbox" checked={chosen.has(row.key)} onChange={() => toggle(row.key)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
                   {info?.thumbnail ? (
                     <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row); }}>

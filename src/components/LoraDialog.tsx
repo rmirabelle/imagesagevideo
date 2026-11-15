@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { FolderOpen, X } from "@phosphor-icons/react";
 import { useState } from "react";
 import { folderOf, type LoraPair } from "../lib/api";
+import { StrengthInput } from "./StrengthInput";
 
 interface Props {
   /** The folder the file browser opens in; empty for the system's choice. */
@@ -24,7 +25,7 @@ const SIDES = [
  * the low-noise model. One of the two can stay empty.
  */
 export function LoraDialog({ folder, onFolder, onAdd, onClose }: Props) {
-  const [pair, setPair] = useState<LoraPair>({ highNoise: "", highNoiseStrength: 1, lowNoise: "", lowNoiseStrength: 1 });
+  const [pair, setPair] = useState<LoraPair>({ highNoise: "", highNoiseStrength: 1, lowNoise: "", lowNoiseStrength: 1, highNoiseOff: false, lowNoiseOff: false });
 
   const browse = async (side: "highNoise" | "lowNoise") => {
     const picked = await open({ multiple: false, filters: LORA_FILTER, defaultPath: folder || undefined });
@@ -54,14 +55,11 @@ export function LoraDialog({ folder, onFolder, onAdd, onClose }: Props) {
                 placeholder="None"
                 onChange={(event) => setPair((current) => ({ ...current, [side.file]: event.target.value }))}
               />
-              <input
-                type="number"
-                min={0}
-                max={2}
-                step={0.05}
+              <StrengthInput
                 value={pair[side.strength]}
-                title="Strength: 1 is full strength, 0 turns the file off"
-                onChange={(event) => setPair((current) => ({ ...current, [side.strength]: Number.isFinite(event.target.valueAsNumber) ? event.target.valueAsNumber : 0 }))}
+                title="Strength, from 0 to 2: 1 is full strength"
+                label={`The strength of the ${side.label}`}
+                onChange={(value) => setPair((current) => ({ ...current, [side.strength]: value }))}
               />
               <button className="button secondary small" onClick={() => void browse(side.file)} aria-label={`Choose the ${side.label}`}><FolderOpen size={15} /></button>
             </label>

@@ -88,6 +88,10 @@ export interface LoraPair {
   highNoiseStrength: number;
   lowNoise: string;
   lowNoiseStrength: number;
+  /** The user turned the high-noise model's file off. The file stays in the list, but no clip uses it. */
+  highNoiseOff: boolean;
+  /** The user turned the low-noise model's file off. */
+  lowNoiseOff: boolean;
 }
 
 export interface Settings {

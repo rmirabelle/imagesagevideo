@@ -75,7 +75,9 @@ pub const DEFAULT_NEGATIVE_PROMPT: &str = "oversaturated colors, overexposed, st
 /**
  * One LoRA for the two Wan 2.2 models: a file for each model, with its
  * strength. An empty file means no LoRA for that model. A strength of 1 is
- * full strength, and 0 turns the file off.
+ * full strength, and 0 turns the file off. The user can also turn each
+ * file off; the file and its strength then stay in the list, but no clip
+ * uses the file.
  */
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -84,11 +86,15 @@ pub struct LoraPair {
     pub high_noise_strength: f64,
     pub low_noise: String,
     pub low_noise_strength: f64,
+    /// The user turned the high-noise model's file off.
+    pub high_noise_off: bool,
+    /// The user turned the low-noise model's file off.
+    pub low_noise_off: bool,
 }
 
 impl Default for LoraPair {
     fn default() -> Self {
-        Self { high_noise: String::new(), high_noise_strength: 1.0, low_noise: String::new(), low_noise_strength: 1.0 }
+        Self { high_noise: String::new(), high_noise_strength: 1.0, low_noise: String::new(), low_noise_strength: 1.0, high_noise_off: false, low_noise_off: false }
     }
 }
 
@@ -167,6 +173,7 @@ impl From<SavedModelFiles> for ModelFiles {
                 high_noise_strength: saved.high_noise_lora_strength,
                 low_noise: saved.lora,
                 low_noise_strength: saved.lora_strength,
+                ..LoraPair::default()
             });
         }
         Self {
@@ -181,7 +188,7 @@ impl From<SavedModelFiles> for ModelFiles {
 }
 
 impl ModelFiles {
-    /// The model files that are not set or do not exist, by name. A LoRA is optional, so it counts only when set.
+    /// The model files that are not set or do not exist, by name. A LoRA is optional, so it counts only when it is set and not turned off.
     pub fn missing(&self) -> Vec<&'static str> {
         let mut missing: Vec<&'static str> = [
             (&self.diffusion_model, "low-noise model"),
@@ -194,10 +201,10 @@ impl ModelFiles {
         .map(|(_, name)| name)
         .collect();
         let lost = |path: &str| !path.trim().is_empty() && !Path::new(path.trim()).is_file();
-        if self.loras.iter().any(|pair| lost(&pair.low_noise)) {
+        if self.loras.iter().any(|pair| !pair.low_noise_off && lost(&pair.low_noise)) {
             missing.push("low-noise LoRA");
         }
-        if self.loras.iter().any(|pair| lost(&pair.high_noise)) {
+        if self.loras.iter().any(|pair| !pair.high_noise_off && lost(&pair.high_noise)) {
             missing.push("high-noise LoRA");
         }
         missing
@@ -229,13 +236,20 @@ impl ModelFiles {
         Some(inside.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"))
     }
 
-    /// The LoRA list of a job: for each pair in sequence, the low-noise model's file, then the high-noise model's. A file of strength 0 is left out.
+    /**
+     * The LoRA list of a job: for each pair in sequence, the low-noise
+     * model's file, then the high-noise model's. A file that is turned off,
+     * or has a strength of 0, is left out. The LoRA folder does not change
+     * when a file is turned off, so the engine does not start again.
+     */
     fn job_loras(&self) -> Vec<Value> {
         self.loras
             .iter()
-            .flat_map(|pair| [(&pair.low_noise, pair.low_noise_strength, false), (&pair.high_noise, pair.high_noise_strength, true)])
-            .filter(|(_, strength, _)| *strength != 0.0)
-            .filter_map(|(lora, strength, high_noise)| {
+            .flat_map(|pair| {
+                [(&pair.low_noise, pair.low_noise_strength, pair.low_noise_off, false), (&pair.high_noise, pair.high_noise_strength, pair.high_noise_off, true)]
+            })
+            .filter(|(_, strength, off, _)| !off && *strength != 0.0)
+            .filter_map(|(lora, strength, _, high_noise)| {
                 let name = self.lora_name(lora)?;
                 Some(if high_noise {
                     json!({ "path": name, "multiplier": strength, "is_high_noise": true })
@@ -929,15 +943,25 @@ mod tests {
         assert_eq!(body["lora"][1], json!({ "path": "wan/Motion_Low.safetensors", "multiplier": 1.0 }));
         assert_eq!(body["lora"][2], json!({ "path": "wan/Motion_High.safetensors", "multiplier": 0.5, "is_high_noise": true }));
 
-        let off = ModelFiles { loras: vec![LoraPair { low_noise_strength: 0.0, high_noise_strength: 0.0, ..motion }], ..ModelFiles::default() };
+        let off = ModelFiles { loras: vec![LoraPair { low_noise_strength: 0.0, high_noise_strength: 0.0, ..motion.clone() }], ..ModelFiles::default() };
         assert!(video_body("x", 832, 464, &off, "data:image/png;base64,AAAA").get("lora").is_none());
+
+        /* A file that the user turned off is left out; the other file of the pair stays. */
+        let low_off = ModelFiles { loras: vec![LoraPair { low_noise_off: true, ..motion.clone() }], ..ModelFiles::default() };
+        let body = video_body("x", 832, 464, &low_off, "data:image/png;base64,AAAA");
+        assert_eq!(body["lora"], json!([{ "path": "Motion_High.safetensors", "multiplier": 0.5, "is_high_noise": true }]));
+        assert!(low_off.same_start(&ModelFiles { loras: vec![motion.clone()], ..ModelFiles::default() }));
+        assert_eq!(ModelFiles { loras: vec![motion.clone()], ..ModelFiles::default() }.missing().iter().filter(|name| name.contains("LoRA")).count(), 2);
+        assert_eq!(low_off.missing().iter().filter(|name| name.contains("LoRA")).collect::<Vec<_>>(), [&"high-noise LoRA"]);
+        let both_off = ModelFiles { loras: vec![LoraPair { low_noise_off: true, high_noise_off: true, ..motion }], ..ModelFiles::default() };
+        assert!(video_body("x", 832, 464, &both_off, "data:image/png;base64,AAAA").get("lora").is_none());
     }
 
     #[test]
     fn one_saved_lora_for_each_model_becomes_the_first_pair() {
         let saved = json!({ "lora": "D:\\l\\low.safetensors", "loraStrength": 0.8, "highNoiseLora": "D:\\l\\high.safetensors" });
         let files: ModelFiles = serde_json::from_value(saved).unwrap();
-        let pair = LoraPair { low_noise: "D:\\l\\low.safetensors".into(), low_noise_strength: 0.8, high_noise: "D:\\l\\high.safetensors".into(), high_noise_strength: 1.0 };
+        let pair = LoraPair { low_noise: "D:\\l\\low.safetensors".into(), low_noise_strength: 0.8, high_noise: "D:\\l\\high.safetensors".into(), high_noise_strength: 1.0, ..LoraPair::default() };
         assert_eq!(files.loras, vec![pair]);
         let again: ModelFiles = serde_json::from_value(serde_json::to_value(&files).unwrap()).unwrap();
         assert_eq!(again, files);

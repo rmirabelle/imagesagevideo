@@ -380,7 +380,10 @@ textarea { width: 100%; resize: vertical; line-height: 1.45; }
 .lora-grip:hover, .lora-row.dragging .lora-grip { color: #eceef2; }
 .lora-row.dragging .lora-grip { cursor: grabbing; }
 .lora-files { min-width: 0; display: grid; gap: 4px; }
-.lora-file { display: grid; grid-template-columns: 34px 1fr 70px; align-items: center; gap: 8px; font-size: 12px; }
+.lora-file { display: grid; grid-template-columns: auto 34px 1fr 70px; align-items: center; gap: 8px; font-size: 12px; }
+.lora-file.off b, .lora-file.off span, .lora-file.off .strength-input { opacity: .45; }
+.lora-file.off span { text-decoration: line-through; }
+.strength-input { min-width: 0; font-size: 12px; }
 .lora-file b { color: var(--muted); font-weight: 600; }
 .lora-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lora-file span.none { color: var(--muted); }
