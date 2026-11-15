@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   CheckCircle,
   CircleNotch,
+  Copy,
   EyeSlash,
   File as FileIcon,
   FilmStrip,
@@ -127,6 +128,8 @@ export default function App() {
   const editCancelled = useRef(false);
   /* The row whose large picture shows. The small picture shows first, until the large one is read. */
   const [zoom, setZoom] = useState<{ id: string; name: string; src: string } | null>(null);
+  /* The row whose prompt went to the clipboard a moment ago. Its button shows a check mark for a short time. */
+  const [copied, setCopied] = useState<string | null>(null);
   /* The file whose name is in the text box now, by its file key. */
   const [renaming, setRenaming] = useState<string | null>(null);
   /* The file that the user asked to delete. The dialog asks before the file goes. */
@@ -384,6 +387,16 @@ export default function App() {
     else if (text.trim() !== row.prompt) void queueSetPrompt(row.jobLayer, text).catch((error) => setMessage(String(error)));
   };
 
+  /* Puts a row's prompt on the clipboard. This is the only way to get the prompt of a layer whose prompt cannot change. */
+  const copyPrompt = (row: Row) => {
+    navigator.clipboard.writeText(row.prompt)
+      .then(() => {
+        setCopied(row.id);
+        window.setTimeout(() => setCopied((current) => (current === row.id ? null : current)), 1500);
+      })
+      .catch((error) => setMessage(`Could not copy the prompt: ${String(error)}`));
+  };
+
   const toggle = (key: string) => setChosen((current) => {
     const next = new Set(current);
     if (next.has(key)) next.delete(key);
@@ -621,6 +634,16 @@ export default function App() {
                         />
                       ))}
                     </div>
+                  )}
+                  {row.prompt && (
+                    <button
+                      className="layer-remove"
+                      title={copied === row.id ? "The prompt is on the clipboard" : "Copy this layer's prompt"}
+                      aria-label={`Copy the prompt of ${row.name}`}
+                      onClick={(event) => { event.stopPropagation(); copyPrompt(row); }}
+                    >
+                      {copied === row.id ? <CheckCircle size={15} weight="fill" /> : <Copy size={15} />}
+                    </button>
                   )}
                   {canEdit && (
                     <button
