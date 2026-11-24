@@ -54,8 +54,9 @@
 - `src-tauri/src/engine.rs` runs stable-diffusion.cpp's `sd-server.exe` with
   Wan 2.2 image-to-video. Its start flags, job request and pinned engine build
   must stay the same as Image Sage's `src-tauri/src/local.rs`
-  (`D:/Code/ImageSage`). It uses Image Sage's installed engine when there is
-  one.
+  (`D:/Code/ImageSage`), with one exception: only this app starts the engine
+  with `--offload-to-cpu`, so the end of a clip does not run out of GPU
+  memory. It uses Image Sage's installed engine when there is one.
 - `src-tauri/src/document.rs` only reads `.imagesage` documents (format
   versions 2 and 3). The format belongs to Image Sage; follow its
   `src-tauri/src/document.rs` and `src/editor/document.ts`.

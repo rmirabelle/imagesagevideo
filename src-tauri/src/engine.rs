@@ -619,6 +619,14 @@ fn spawn_server(dir: &Path, files: &ModelFiles) -> Result<Server, String> {
          * run time it works.
          */
         .args(["--lora-apply-mode", "at_runtime"])
+        /*
+         * The models stay in system memory, and only the model in use goes to
+         * the GPU. Without it, the end of a clip (decoding all its pictures)
+         * did not fit in the GPU memory next to both models, and the driver
+         * moved the extra to system memory, which made it very slow. Image
+         * Sage does not use this flag; it is the one start flag that differs.
+         */
+        .arg("--offload-to-cpu")
         /* The conditioning cache can hand a later job an earlier prompt's encoding, so it is off. */
         .args(["--conditioning-cache-size", "0"]);
     if let Some(dir) = files.lora_dir() {
