@@ -140,6 +140,7 @@ export const queueClearDone = () => invoke<void>("queue_clear_done");
 export const queueSetPrompt = (layer: number, prompt: string) => invoke<void>("queue_set_prompt", { layer, prompt });
 /** Stops the clip in work and removes it from its layer; the job goes on with the next clip. */
 export const queueCancelClip = () => invoke<void>("queue_cancel_clip");
+export const queueNewPass = (layer: number) => invoke<void>("queue_new_pass", { layer });
 export const settingsGet =() => invoke<SettingsView>("settings_get");
 export const settingsSet = (settings: Settings) => invoke<void>("settings_set", { settings });
 export const settingsFromImageSage = () => invoke<ModelFiles>("settings_from_image_sage");

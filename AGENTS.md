@@ -39,6 +39,10 @@
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start
   after it use the new prompt.
+- Again (`queue_new_pass`) makes a done layer's video again from the layer's
+  picture: its clips wait again, the new video gets a new file name and takes
+  the old one's place in the list, and the old video stays in its folder. It
+  does not raise the generation; a finished job starts again.
 - The list shows each file's name with buttons to show it in its folder,
   rename it and delete it; a done layer has the same for its video.
   `file_rename` and `file_delete` (`queue.rs`) accept only documents, photos

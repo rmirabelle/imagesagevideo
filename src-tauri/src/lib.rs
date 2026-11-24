@@ -119,6 +119,7 @@ pub fn run() {
             queue::queue_clear_done,
             queue::queue_set_prompt,
             queue::queue_cancel_clip,
+            queue::queue_new_pass,
             queue::file_rename,
             queue::file_delete,
             take_pending_open_document,

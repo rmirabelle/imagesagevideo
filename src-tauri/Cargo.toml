@@ -1,6 +1,6 @@
 [package]
 name = "imagesagevideo"
-version = "0.8.0"
+version = "0.9.0"
 description = "Make Wan 2.2 video clips from every layer of an Image Sage document"
 authors = ["Rob Mirabelle"]
 edition = "2021"

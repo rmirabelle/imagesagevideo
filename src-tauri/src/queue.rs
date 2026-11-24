@@ -208,6 +208,25 @@ impl Job {
         changed
     }
 
+    /**
+     * Prepares a new pass of a layer whose video is done: its clips wait
+     * again, with the same number of clips, and the first clip starts again
+     * from the layer's picture. The old video stays in its folder but
+     * leaves the layer; the new video gets a new file name when it is
+     * joined. Returns false when the layer has no video.
+     */
+    fn new_pass(&mut self, layer: usize) -> bool {
+        let Some(layer_job) = self.layers.get_mut(layer) else { return false };
+        if layer_job.video.is_none() || layer_job.clips.is_empty() {
+            return false;
+        }
+        layer_job.video = None;
+        for clip in &mut layer_job.clips {
+            *clip = Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false };
+        }
+        true
+    }
+
     /// Removes from the list the layer whose video is this file. Returns false when no layer has this video.
     fn forget_video(&mut self, path: &str) -> bool {
         let mut changed = false;
@@ -665,6 +684,32 @@ pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, p
 }
 
 /**
+ * Makes a layer's video again from the layer's picture, as a new pass. The
+ * new video gets a new file name and takes the old video's place in the
+ * list; the old video stays in its folder. A job that runs makes the pass
+ * after the clips before it, so the generation does not change. A paused
+ * job stays paused. A finished job starts again.
+ */
+#[tauri::command]
+pub fn queue_new_pass(app: AppHandle, queue: State<'_, Queue>, engine: State<'_, Engine>, layer: usize) -> Result<(), String> {
+    let missing = settings::load(&app).files.missing();
+    if !missing.is_empty() {
+        return Err(format!("Choose the Wan 2.2 {} in Settings.", missing.join(", ")));
+    }
+    let mut inner = queue.lock();
+    if !inner.job.as_mut().is_some_and(|job| job.new_pass(layer)) {
+        return Err("This layer has no finished video.".into());
+    }
+    if inner.state == RunState::Finished {
+        spawn_runner(&app, &queue, &engine, &mut inner);
+    } else {
+        save_job(&app, inner.job.as_ref());
+        publish(&app, &inner);
+    }
+    Ok(())
+}
+
+/**
  * Renames a document, a photo or a finished video on the disk; the file
  * stays in its folder and keeps its extension. A job that uses the file
  * gets the new path, and the runner goes on, so the generation does not
@@ -1038,6 +1083,20 @@ mod tests {
         job.layers[1].name = "Fox".into();
         assert!(job.repath(r"D:\Art\Fox.imagesage", r"D:\Art\Wolf.imagesage"));
         assert_eq!(job.layers[1].name, "Wolf");
+    }
+
+    #[test]
+    fn a_new_pass_makes_the_layer_again() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Done, Done], [Done, Pending, Pending]]);
+        assert!(!job.new_pass(0));
+        job.layers[0].video = Some(r"D:\Out\fox.webm".into());
+        job.layers[0].clips[0].cleared = true;
+        assert!(job.new_pass(0));
+        assert!(job.layers[0].video.is_none());
+        assert!(job.layers[0].clips.iter().all(|clip| clip.status == Pending && clip.file.is_none() && !clip.cleared));
+        assert_eq!(job.next_pending(), Some((0, 0)));
+        assert!(!job.new_pass(5));
     }
 
     #[test]

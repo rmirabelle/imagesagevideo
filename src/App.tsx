@@ -2,6 +2,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowClockwise,
   CheckCircle,
   CircleNotch,
   Copy,
@@ -32,6 +33,7 @@ import {
   queueClear,
   queueCancelClip,
   queueClearDone,
+  queueNewPass,
   queueSetPrompt,
   queueGet,
   queuePause,
@@ -619,6 +621,15 @@ export default function App() {
                         onClick={(event) => { event.stopPropagation(); void playVideo(row.video!).catch((error) => setMessage(String(error))); }}
                       >
                         <Play size={11} weight="fill" /> {(row.clips?.length ?? 0) * CLIP_SECONDS} s
+                      </button>
+                      <button
+                        className="clip new-pass"
+                        title="Make this video again from the layer's picture. The new video gets a new file name and takes this video's place in the list. This video stays in its folder."
+                        aria-label={`Make the video of ${row.name} again`}
+                        disabled={missing.length > 0}
+                        onClick={(event) => { event.stopPropagation(); void queueNewPass(row.jobLayer).catch((error) => setMessage(String(error))); }}
+                      >
+                        <ArrowClockwise size={11} weight="bold" /> Again
                       </button>
                     </div>
                   )}
