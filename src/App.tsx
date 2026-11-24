@@ -123,6 +123,8 @@ export default function App() {
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   /* The layers the user removed from the list. The file does not change, and they come back when it is opened again. */
   const [removed, setRemoved] = useState<Set<string>>(new Set());
+  /* The layers that went to the job. Their file stays in the list for its other layers; they come back when the file is opened again. */
+  const [sent, setSent] = useState<Set<string>>(new Set());
   /* The prompts the user changed, by layer key. The file does not change; the job gets these prompts. */
   const [prompts, setPrompts] = useState<Map<string, string>>(new Map());
   /* The row whose prompt is in the text box now. */
@@ -180,6 +182,7 @@ export default function App() {
       setStaged((current) => [...current, ...opened.map((info) => fileKey(info.path)).filter((file, index, all) => !current.includes(file) && all.indexOf(file) === index)]);
       setChosen((current) => new Set([...current, ...keys]));
       setRemoved((current) => new Set([...current].filter((key) => !keys.includes(key))));
+      setSent((current) => new Set([...current].filter((key) => !keys.includes(key))));
       /* One photo has no prompt, so its text box opens at once. */
       const only = opened.length === 1 && opened[0].layers.length === 1 ? opened[0] : null;
       if (only && only.layers[0].tile === PHOTO_TILE) setEditing(`s:${layerKey(only.path, PHOTO_TILE)}`);
@@ -244,22 +247,33 @@ export default function App() {
     setStaged((current) => current.filter((file) => !files.has(file)));
     setChosen((current) => new Set([...current].filter(stays)));
     setRemoved((current) => new Set([...current].filter(stays)));
+    setSent((current) => new Set([...current].filter(stays)));
     setPrompts((current) => new Map([...current].filter(([key]) => stays(key))));
     setEditing(null);
   };
 
-  /* Starts a job with the chosen layers, or adds them to the job that exists. Their files then leave the list of files that wait. */
+  /**
+   * Starts a job with the chosen layers, or adds them to the job that
+   * exists. The layers that were not chosen stay in the list; a file leaves
+   * the list only when none of its layers wait.
+   */
   const start = async () => {
-    const sent = stagedRows.filter((row) => chosen.has(row.key));
-    if (!sent.length) return;
+    const chosenRows = stagedRows.filter((row) => chosen.has(row.key));
+    if (!chosenRows.length) return;
     setMessage(null);
     try {
       await queueStart({
         outputDir,
         clips: clipsPerLayer,
-        layers: sent.map((row) => ({ document: row.path, tile: row.tile, prompt: prompts.has(row.key) ? row.prompt : null }))
+        layers: chosenRows.map((row) => ({ document: row.path, tile: row.tile, prompt: prompts.has(row.key) ? row.prompt : null }))
       });
-      unstage(new Set(sent.map((row) => fileKey(row.path))));
+      const sentKeys = new Set([...sent, ...chosenRows.map((row) => row.key)]);
+      const done = new Set(staged.filter((file) => !stagedRows.some((row) => fileKey(row.path) === file && !sentKeys.has(row.key))));
+      setSent(sentKeys);
+      setChosen((current) => new Set([...current].filter((key) => !sentKeys.has(key))));
+      setPrompts((current) => new Map([...current].filter(([key]) => !sentKeys.has(key))));
+      setEditing(null);
+      if (done.size) unstage(done);
     } catch (error) {
       setMessage(String(error));
     }
@@ -320,6 +334,7 @@ export default function App() {
       setStaged((current) => current.map((file) => (file === from ? to : file)));
       setChosen((current) => new Set([...current].map(moved)));
       setRemoved((current) => new Set([...current].map(moved)));
+      setSent((current) => new Set([...current].map(moved)));
       setPrompts((current) => new Map([...current].map(([key, text]) => [moved(key), text])));
       setEditing(null);
     } catch (error) {
@@ -422,7 +437,7 @@ export default function App() {
       const key = layerKey(info!.path, layer.tile);
       return { id: `s:${key}`, key, path: info!.path, tile: layer.tile, jobLayer: -1, number: index + 1, name: layer.name, prompt: prompts.get(key) ?? layer.prompt, clips: null, video: null };
     });
-  }).filter((row) => !removed.has(row.key));
+  }).filter((row) => !removed.has(row.key) && !sent.has(row.key));
   /* The job's layers that have a clip in the list. */
   const jobRows: Row[] = (job?.layers ?? []).map((layer, index) => ({
     id: `j:${index}`, key: layerKey(layer.document, layer.tile), path: layer.document, tile: layer.tile, jobLayer: index,

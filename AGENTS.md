@@ -34,7 +34,9 @@
   or adds layers to the job that exists; the runner looks for a new clip
   again before it ends, so layers that are added while it runs are made.
   The window keeps the opened files whose layers wait for Start
-  (`src/App.tsx`); those layers are not in the job.
+  (`src/App.tsx`); those layers are not in the job. Start sends only the
+  chosen layers; a file's other layers stay in the list until the user
+  clears them.
 - Cancel Clip (`queue_cancel_clip`) removes the clip in work from its layer and
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start
