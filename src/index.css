@@ -446,3 +446,13 @@ textarea { width: 100%; resize: vertical; line-height: 1.45; }
 .crash-screen { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; height: 100vh; padding: 32px; overflow: auto; color: #e6e9f2; background: #15171d; }
 .crash-screen h1 { margin: 0; font-size: 18px; }
 .crash-screen pre { max-width: 100%; margin: 0; color: #fecaca; font-size: 12px; white-space: pre-wrap; user-select: text; }
+/* A row's grip: the user drags the row by it to change the order of the layers */
+.layer-grip { width: 18px; height: 40px; flex: 0 0 auto; display: grid; place-items: center; margin: 0 -6px 0 -4px; border-radius: 4px; color: #5d6375; cursor: grab; touch-action: none; }
+.layer-grip:hover { color: #c8cbd3; background: rgba(255,255,255,.06); }
+.layer-row { position: relative; }
+.layer-row.dragged { opacity: .45; }
+.layer-row.drop-before::before, .layer-row.drop-after::after { content: ""; position: absolute; left: 4px; right: 4px; height: 2px; border-radius: 1px; background: var(--accent); pointer-events: none; }
+.layer-row.drop-before::before { top: -1px; }
+.layer-row.drop-after::after { bottom: -1px; }
+.app-shell.dragging, .app-shell.dragging * { cursor: grabbing !important; }
+.app-shell.dragging .layer-row:hover { background: transparent; }

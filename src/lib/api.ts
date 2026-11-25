@@ -138,6 +138,8 @@ export const queueClear = () => invoke<void>("queue_clear");
 export const queueClearDone = () => invoke<void>("queue_clear_done");
 /** Changes the prompt of a job's layer, by the layer's place in the job. The clips of that layer that start after this use it. */
 export const queueSetPrompt = (layer: number, prompt: string) => invoke<void>("queue_set_prompt", { layer, prompt });
+/** Moves a job's layer to another place; `to` is its place after the move. The job makes the layers in their order. */
+export const queueMoveLayer = (from: number, to: number) => invoke<void>("queue_move_layer", { from, to });
 /** Stops the clip in work and removes it from its layer; the job goes on with the next clip. */
 export const queueCancelClip = () => invoke<void>("queue_cancel_clip");
 export const queueNewPass = (layer: number) => invoke<void>("queue_new_pass", { layer });

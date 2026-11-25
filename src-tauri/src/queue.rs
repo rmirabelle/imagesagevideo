@@ -23,7 +23,9 @@ use crate::{
  *
  * The job runs in the Rust side of the app, so it goes on while the window
  * is hidden in the tray. The clips are made one after the other, in the
- * order of the job's layers; a document's bottom layer is first.
+ * order of the job's layers, which is the order of the list. The user can
+ * drag a layer to another place in the list (`queue_move_layer`); the
+ * runner finds its layer by the layer's id, so a move does not stop it.
  *
  * Pause stops the clip that is in work and ends the engine, which removes
  * the model from the GPU memory. The engine cannot keep half a clip, so
@@ -63,6 +65,9 @@ pub struct Clip {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LayerJob {
+    /// The layer's own number in the job. It does not change when the layer moves to another place.
+    #[serde(default)]
+    id: u64,
     /// The layer's place in the document, from 0 at the bottom.
     index: usize,
     tile: String,
@@ -119,6 +124,34 @@ impl Job {
             layer.clip_width = self.clip_width;
             layer.clip_height = self.clip_height;
         }
+    }
+
+    /// Gives an id to each layer that has none: a layer that was just made, or a layer of a job list from before version 0.10.
+    fn give_ids(&mut self) {
+        let mut next = self.layers.iter().map(|layer| layer.id).max().unwrap_or(0) + 1;
+        for layer in self.layers.iter_mut().filter(|layer| layer.id == 0) {
+            layer.id = next;
+            next += 1;
+        }
+    }
+
+    /// The place of the layer with this id.
+    fn place_of(&self, id: u64) -> Option<usize> {
+        self.layers.iter().position(|layer| layer.id == id)
+    }
+
+    fn layer_mut(&mut self, id: u64) -> Option<&mut LayerJob> {
+        self.layers.iter_mut().find(|layer| layer.id == id)
+    }
+
+    /// Moves a layer from one place to another. `to` is the layer's place after the move. Returns false when a place is not in the job.
+    fn move_layer(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.layers.len() || to >= self.layers.len() {
+            return false;
+        }
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        true
     }
 
     fn next_pending(&self) -> Option<(usize, usize)> {
@@ -353,6 +386,7 @@ pub fn restore(app: &AppHandle) -> Queue {
         .and_then(|bytes| serde_json::from_slice::<Job>(&bytes).ok());
     if let Some(job) = job.as_mut() {
         job.fill_layers_from_old_job();
+        job.give_ids();
         for clip in job.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
             if clip.status == ClipStatus::Running {
                 clip.status = ClipStatus::Pending;
@@ -453,33 +487,35 @@ pub fn queue_get(queue: State<'_, Queue>) -> Snapshot {
     queue.lock().snapshot()
 }
 
-/// Reads the documents of a start request and makes the job's layers: the documents in the request's order, each with its bottom layer first.
+/// Reads the documents of a start request and makes the job's layers, in the request's order: the order of the window's list.
 fn layer_jobs(request: &[StartLayer], clips: usize) -> Result<Vec<LayerJob>, String> {
-    let mut documents: Vec<&str> = Vec::new();
-    for layer in request {
-        if !documents.contains(&layer.document.as_str()) {
-            documents.push(&layer.document);
+    let mut documents: Vec<(&str, Vec<document::LayerRef>, (u32, u32))> = Vec::new();
+    let mut jobs: Vec<LayerJob> = Vec::new();
+    for asked in request {
+        if !documents.iter().any(|(document, _, _)| *document == asked.document) {
+            let path = Path::new(&asked.document);
+            let layers = document::read_layers(path)?;
+            let size = document::document_clip_size(path, &layers)?;
+            documents.push((&asked.document, layers, size));
         }
-    }
-    let mut jobs = Vec::new();
-    for document in documents {
-        let path = Path::new(document);
-        let layers = document::read_layers(path)?;
-        let (clip_width, clip_height) = document::document_clip_size(path, &layers)?;
-        for (index, layer) in layers.into_iter().enumerate() {
-            let Some(asked) = request.iter().find(|asked| asked.document == document && asked.tile == layer.tile) else { continue };
-            jobs.push(LayerJob {
-                index,
-                prompt: asked.prompt.as_ref().map(|prompt| prompt.trim().to_string()).unwrap_or(layer.prompt),
-                tile: layer.tile,
-                name: layer.name,
-                clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
-                video: None,
-                document: crate::files::windows_path(document),
-                clip_width,
-                clip_height,
-            });
+        let Some((_, layers, (clip_width, clip_height))) = documents.iter().find(|(document, _, _)| *document == asked.document) else { continue };
+        let Some((index, layer)) = layers.iter().enumerate().find(|(_, layer)| layer.tile == asked.tile) else { continue };
+        let path = crate::files::windows_path(&asked.document);
+        if jobs.iter().any(|job| job.index == index && job.document == path) {
+            continue;
         }
+        jobs.push(LayerJob {
+            id: 0,
+            index,
+            prompt: asked.prompt.as_ref().map(|prompt| prompt.trim().to_string()).unwrap_or_else(|| layer.prompt.clone()),
+            tile: layer.tile.clone(),
+            name: layer.name.clone(),
+            clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
+            video: None,
+            document: path,
+            clip_width: *clip_width,
+            clip_height: *clip_height,
+        });
     }
     Ok(jobs)
 }
@@ -508,6 +544,7 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
     let mut inner = queue.lock();
     if let Some(job) = inner.job.as_mut() {
         job.layers.extend(jobs);
+        job.give_ids();
         settings::save(&app, &saved)?;
         if inner.state == RunState::Finished {
             spawn_runner(&app, &queue, &engine, &mut inner);
@@ -523,7 +560,8 @@ pub async fn queue_start(app: AppHandle, queue: State<'_, Queue>, engine: State<
         return Err("Choose the folder for the videos first.".into());
     }
     std::fs::create_dir_all(&output).map_err(|error| format!("Could not use the folder {}: {error}", output.display()))?;
-    let job = Job { output_dir: output.to_string_lossy().into_owned(), layers: jobs, document: String::new(), clip_width: 0, clip_height: 0 };
+    let mut job = Job { output_dir: output.to_string_lossy().into_owned(), layers: jobs, document: String::new(), clip_width: 0, clip_height: 0 };
+    job.give_ids();
     saved.output_dir = job.output_dir.clone();
     settings::save(&app, &saved)?;
     inner.job = Some(job);
@@ -684,6 +722,30 @@ pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, p
 }
 
 /**
+ * Moves a layer to another place in the job; the job can be running. The
+ * clips are made in the order of the layers, so this changes which layer
+ * is made next. The runner finds its layer by the layer's id, so it goes
+ * on and the generation does not change. `to` is the layer's place after
+ * the move.
+ */
+#[tauri::command]
+pub fn queue_move_layer(app: AppHandle, queue: State<'_, Queue>, from: usize, to: usize) -> Result<(), String> {
+    let mut guard = queue.lock();
+    let inner = &mut *guard;
+    let job = inner.job.as_mut().ok_or("There is no job.")?;
+    let current = inner.current.as_ref().and_then(|current| job.layers.get(current.layer)).map(|layer| layer.id);
+    if !job.move_layer(from, to) {
+        return Err("The job does not have this layer.".into());
+    }
+    if let (Some(current), Some(id)) = (inner.current.as_mut(), current) {
+        current.layer = job.place_of(id).unwrap_or(current.layer);
+    }
+    save_job(&app, inner.job.as_ref());
+    publish(&app, inner);
+    Ok(())
+}
+
+/**
  * Makes a layer's video again from the layer's picture, as a new pass. The
  * new video gets a new file name and takes the old video's place in the
  * list; the old video stays in its folder. A job that runs makes the pass
@@ -796,13 +858,13 @@ fn update<T>(app: &AppHandle, queue: &Queue, generation: u64, save: bool, change
  * the job runs, so the runner looks for a new clip again before it ends.
  */
 async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
-    let mut picture: Option<(usize, String)> = None;
+    let mut picture: Option<(u64, String)> = None;
     let mut failures_in_a_row = 0_u32;
     loop {
         /* A layer can have all its clips done but not joined: the user cancelled its last clip, or the app closed before the join. */
-        let Some(layers) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(0, |job| job.layers.len())) else { return };
-        for layer in 0..layers {
-            if join_layer(&app, &queue, generation, layer).await.is_none() {
+        let Some(ids) = update(&app, &queue, generation, false, |inner| inner.job.as_ref().map_or(Vec::new(), |job| job.layers.iter().map(|layer| layer.id).collect())) else { return };
+        for id in ids {
+            if join_layer(&app, &queue, generation, id).await.is_none() {
                 return;
             }
         }
@@ -811,18 +873,21 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
                 let job = inner.job.as_mut()?;
                 let (layer, clip) = job.next_pending()?;
                 job.layers[layer].clips[clip].status = ClipStatus::Running;
-                let work = (layer, clip, job.clone());
+                let work = (job.layers[layer].id, clip, job.layers[layer].clone(), job.output_dir.clone());
                 inner.current = Some(Current { layer, clip, stage: "preparing", progress: 0.0 });
                 Some(work)
             });
             let Some(next) = next else { return };
-            let Some((layer, clip, job)) = next else { break };
-            let made = make_one(&app, &queue, &engine, generation, &job, layer, clip, &mut picture).await;
+            let Some((id, clip, layer_job, output_dir)) = next else { break };
+            let made = make_one(&app, &queue, &engine, generation, &output_dir, &layer_job, clip, &mut picture).await;
             failures_in_a_row = if made.is_ok() { 0 } else { failures_in_a_row + 1 };
             let stop = failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
             let updated = update(&app, &queue, generation, true, |inner| {
-                let Some(job) = inner.job.as_mut() else { return };
-                let clips = &mut job.layers[layer].clips;
+                let Some(layer_job) = inner.job.as_mut().and_then(|job| job.layer_mut(id)) else { return };
+                let clips = &mut layer_job.clips;
+                if clip >= clips.len() {
+                    return;
+                }
                 match &made {
                     Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false },
                     Err(error) => {
@@ -849,7 +914,7 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
                 engine.stop();
                 return;
             }
-            if made.is_ok() && join_layer(&app, &queue, generation, layer).await.is_none() {
+            if made.is_ok() && join_layer(&app, &queue, generation, id).await.is_none() {
                 return;
             }
         }
@@ -880,10 +945,11 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
  * cut in two. If the job was paused during the join, the new video is
  * removed and the clips stay, so Resume joins them again.
  */
-async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, layer: usize) -> Option<()> {
+async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, id: u64) -> Option<()> {
     let work = update(app, queue, generation, false, |inner| {
         let job = inner.job.as_ref()?;
-        let layer_job = job.layers.get(layer)?;
+        let layer = job.place_of(id)?;
+        let layer_job = &job.layers[layer];
         if layer_job.video.is_some() || layer_job.clips.is_empty() || !layer_job.all_done() {
             return None;
         }
@@ -903,7 +969,7 @@ async fn join_layer(app: &AppHandle, queue: &Queue, generation: u64, layer: usiz
             inner.current = None;
             match &joined {
                 Ok(file) => {
-                    if let Some(layer_job) = inner.job.as_mut().and_then(|job| job.layers.get_mut(layer)) {
+                    if let Some(layer_job) = inner.job.as_mut().and_then(|job| job.layer_mut(id)) {
                         layer_job.video = Some(file.clone());
                         for clip in &mut layer_job.clips {
                             clip.file = None;
@@ -949,17 +1015,17 @@ async fn make_one(
     queue: &Queue,
     engine: &Engine,
     generation: u64,
-    job: &Job,
-    layer: usize,
+    output_dir: &str,
+    layer_job: &LayerJob,
     clip: usize,
-    picture: &mut Option<(usize, String)>,
+    picture: &mut Option<(u64, String)>,
 ) -> Result<String, String> {
-    let layer_job = &job.layers[layer];
+    let id = layer_job.id;
     let size = (layer_job.clip_width, layer_job.clip_height);
     let continued;
     let image = if clip == 0 {
         /* The first clip starts from the layer's picture. It is kept, so Retry does not make it again. */
-        if picture.as_ref().is_none_or(|(made_for, _)| *made_for != layer) {
+        if picture.as_ref().is_none_or(|(made_for, _)| *made_for != id) {
             let (document, index) = (layer_job.document.clone(), layer_job.index);
             let data_url = tauri::async_runtime::spawn_blocking(move || {
                 let layers = document::read_layers(Path::new(&document))?;
@@ -970,7 +1036,7 @@ async fn make_one(
             })
             .await
             .map_err(|error| format!("Reading the layer stopped unexpectedly: {error}"))??;
-            *picture = Some((layer, data_url));
+            *picture = Some((id, data_url));
         }
         picture.as_ref().map(|(_, data_url)| data_url.as_str()).unwrap_or_default()
     } else {
@@ -987,7 +1053,9 @@ async fn make_one(
     let files = settings::load(app).files;
     let report = |stage: &'static str, progress: f64| {
         update(app, queue, generation, false, |inner| {
-            inner.current = Some(Current { layer, clip, stage, progress });
+            if let Some(layer) = inner.job.as_ref().and_then(|job| job.place_of(id)) {
+                inner.current = Some(Current { layer, clip, stage, progress });
+            }
         });
     };
     let bytes = engine::make_clip(app, engine, &files, &layer_job.prompt, size, image, |step| match step {
@@ -1002,7 +1070,7 @@ async fn make_one(
     })
     .await?;
     let name = format!("{}-{}", layer_job.file_stem(), clip + 1);
-    let path = unused_path(Path::new(&job.output_dir), &name);
+    let path = unused_path(Path::new(output_dir), &name);
     std::fs::write(&path, bytes).map_err(|error| format!("Could not save {}: {error}", path.display()))?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -1021,6 +1089,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, clips)| LayerJob {
+                    id: index as u64 + 1,
                     index,
                     tile: format!("history/{:04}-layer.png", index + 1),
                     name: format!("Layer {}", index + 1),
@@ -1123,12 +1192,31 @@ mod tests {
     }
 
     #[test]
-    fn clips_are_made_bottom_layer_first() {
+    fn clips_are_made_in_the_order_of_the_layers() {
         use ClipStatus::*;
         let two_layers = job(&[[Done, Failed, Done], [Done, Pending, Pending]]);
         assert_eq!(two_layers.next_pending(), Some((1, 1)));
         assert_eq!((two_layers.count(Done), two_layers.count(Failed), two_layers.total()), (3, 1, 6));
         assert_eq!(job(&[[Done, Done, Failed]]).next_pending(), None);
+    }
+
+    #[test]
+    fn a_moved_layer_is_made_first_and_keeps_its_id() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Pending, Pending], [Pending, Pending, Pending], [Pending, Pending, Pending]]);
+        assert!(job.move_layer(2, 0));
+        assert_eq!(job.next_pending(), Some((0, 0)));
+        assert_eq!(job.layers.iter().map(|layer| layer.id).collect::<Vec<_>>(), [3, 1, 2]);
+        assert_eq!(job.place_of(1), Some(1));
+        assert!(job.move_layer(0, 2));
+        assert_eq!(job.layers.iter().map(|layer| layer.id).collect::<Vec<_>>(), [1, 2, 3]);
+        assert!(!job.move_layer(0, 3));
+        for layer in &mut job.layers {
+            layer.id = 0;
+        }
+        job.layers[1].id = 7;
+        job.give_ids();
+        assert_eq!(job.layers.iter().map(|layer| layer.id).collect::<Vec<_>>(), [8, 7, 9]);
     }
 
     #[test]

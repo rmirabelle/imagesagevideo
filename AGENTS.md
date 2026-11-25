@@ -37,6 +37,12 @@
   (`src/App.tsx`); those layers are not in the job. Start sends only the
   chosen layers; a file's other layers stay in the list until the user
   clears them.
+- The list shows the layers in the order the job makes them, from the top
+  down. The user drags a row by its grip to move it in its part of the list:
+  the layers that wait (`order` in `src/App.tsx`; Start sends them in that
+  order) or the job's layers (`queue_move_layer`). A new file's top layer is
+  first. Each `LayerJob` has an `id` that does not change when it moves; the
+  runner finds its layer by that id, so a move does not raise the generation.
 - Cancel Clip (`queue_cancel_clip`) removes the clip in work from its layer and
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start

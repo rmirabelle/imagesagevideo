@@ -118,6 +118,7 @@ pub fn run() {
             queue::queue_clear,
             queue::queue_clear_done,
             queue::queue_set_prompt,
+            queue::queue_move_layer,
             queue::queue_cancel_clip,
             queue::queue_new_pass,
             queue::file_rename,

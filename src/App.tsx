@@ -6,6 +6,7 @@ import {
   CheckCircle,
   CircleNotch,
   Copy,
+  DotsSixVertical,
   EyeSlash,
   File as FileIcon,
   FilmStrip,
@@ -18,7 +19,7 @@ import {
   WarningCircle,
   X
 } from "@phosphor-icons/react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { AboutDialog } from "./components/AboutDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { TitleBar } from "./components/TitleBar";
@@ -33,6 +34,7 @@ import {
   queueClear,
   queueCancelClip,
   queueClearDone,
+  queueMoveLayer,
   queueNewPass,
   queueSetPrompt,
   queueGet,
@@ -85,18 +87,15 @@ interface Row {
   video: string | null;
 }
 
-/** The rows as the list shows them: the files in their order, and the top layer of each file first, as Image Sage does. */
-function topLayerFirst(rows: Row[]): Row[] {
-  const shown: Row[] = [];
-  let group: Row[] = [];
-  for (const row of rows) {
-    if (group.length && fileKey(group[0].path) !== fileKey(row.path)) {
-      shown.push(...group.reverse());
-      group = [];
-    }
-    group.push(row);
-  }
-  return [...shown, ...group.reverse()];
+/** The part of the list a row is in: the layers that wait for Start, or the job's layers. A row moves only in its own part. */
+type Section = "s" | "j";
+
+/** Moves one item of a list to another place. `to` is the item's place after the move. */
+function moved<T>(items: T[], from: number, to: number): T[] {
+  const next = [...items];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
 }
 
 /**
@@ -119,6 +118,11 @@ export default function App() {
   const [known, setKnown] = useState<Map<string, DocumentInfo>>(new Map());
   /* The file keys of the files whose layers wait for Start, in the order the user opened them. */
   const [staged, setStaged] = useState<string[]>([]);
+  /* The layer keys of the layers that wait, in the order of the list. A new file's top layer is first, as in Image Sage. The job gets its layers in this order. */
+  const [order, setOrder] = useState<string[]>([]);
+  /* The row that the user drags by its grip, and the place in its part of the list where it goes when the user releases it. */
+  const [drag, setDrag] = useState<{ section: Section; from: number; over: number } | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const [opening, setOpening] = useState(false);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   /* The layers the user removed from the list. The file does not change, and they come back when it is opened again. */
@@ -180,6 +184,8 @@ export default function App() {
     if (stage) {
       const keys = opened.flatMap((info) => info.layers.map((layer) => layerKey(info.path, layer.tile)));
       setStaged((current) => [...current, ...opened.map((info) => fileKey(info.path)).filter((file, index, all) => !current.includes(file) && all.indexOf(file) === index)]);
+      const topFirst = opened.flatMap((info) => info.layers.map((layer) => layerKey(info.path, layer.tile)).reverse());
+      setOrder((current) => [...current, ...topFirst.filter((key, index, all) => !current.includes(key) && all.indexOf(key) === index)]);
       setChosen((current) => new Set([...current, ...keys]));
       setRemoved((current) => new Set([...current].filter((key) => !keys.includes(key))));
       setSent((current) => new Set([...current].filter((key) => !keys.includes(key))));
@@ -245,6 +251,7 @@ export default function App() {
   const unstage = (files: Set<string>) => {
     const stays = (key: string) => !files.has(key.slice(0, key.lastIndexOf("|")));
     setStaged((current) => current.filter((file) => !files.has(file)));
+    setOrder((current) => current.filter(stays));
     setChosen((current) => new Set([...current].filter(stays)));
     setRemoved((current) => new Set([...current].filter(stays)));
     setSent((current) => new Set([...current].filter(stays)));
@@ -286,6 +293,9 @@ export default function App() {
       await queueClear();
       setPreview(null);
       const opened = await loadDocuments([...new Set(layers.map((layer) => layer.document))], true);
+      /* The job's layers come back in the job's order. */
+      const jobKeys = layers.map((layer) => layerKey(layer.document, layer.tile));
+      setOrder((current) => [...current.filter((key) => !jobKeys.includes(key)), ...jobKeys.filter((key) => current.includes(key))]);
       setPrompts((current) => {
         const next = new Map(current);
         for (const layer of layers) {
@@ -324,7 +334,7 @@ export default function App() {
       const [from, to] = [fileKey(path), fileKey(renamed)];
       if (renamed === path || !known.has(from)) return;
       const info = await openDocument(renamed);
-      const moved = (key: string) => (key.startsWith(`${from}|`) ? `${to}|${key.slice(from.length + 1)}` : key);
+      const renamedKey = (key: string) => (key.startsWith(`${from}|`) ? `${to}|${key.slice(from.length + 1)}` : key);
       setKnown((current) => {
         const next = new Map(current);
         next.delete(from);
@@ -332,10 +342,11 @@ export default function App() {
         return next;
       });
       setStaged((current) => current.map((file) => (file === from ? to : file)));
-      setChosen((current) => new Set([...current].map(moved)));
-      setRemoved((current) => new Set([...current].map(moved)));
-      setSent((current) => new Set([...current].map(moved)));
-      setPrompts((current) => new Map([...current].map(([key, text]) => [moved(key), text])));
+      setOrder((current) => current.map(renamedKey));
+      setChosen((current) => new Set([...current].map(renamedKey)));
+      setRemoved((current) => new Set([...current].map(renamedKey)));
+      setSent((current) => new Set([...current].map(renamedKey)));
+      setPrompts((current) => new Map([...current].map(([key, text]) => [renamedKey(key), text])));
       setEditing(null);
     } catch (error) {
       setMessage(String(error));
@@ -430,21 +441,95 @@ export default function App() {
     });
   };
 
-  /* The layers that wait for Start: each file's layers, bottom layer first. */
+  /* The layers that wait for Start, in the order of the list. */
   const stagedRows: Row[] = staged.flatMap((file) => {
     const info = known.get(file);
     return (info?.layers ?? []).map((layer, index) => {
       const key = layerKey(info!.path, layer.tile);
       return { id: `s:${key}`, key, path: info!.path, tile: layer.tile, jobLayer: -1, number: index + 1, name: layer.name, prompt: prompts.get(key) ?? layer.prompt, clips: null, video: null };
     });
-  }).filter((row) => !removed.has(row.key) && !sent.has(row.key));
-  /* The job's layers that have a clip in the list. */
+  }).filter((row) => !removed.has(row.key) && !sent.has(row.key))
+    .sort((a, b) => (order.indexOf(a.key) + 1 || Infinity) - (order.indexOf(b.key) + 1 || Infinity));
+  /* The job's layers that have a clip in the list, in the order the job makes them. */
   const jobRows: Row[] = (job?.layers ?? []).map((layer, index) => ({
     id: `j:${index}`, key: layerKey(layer.document, layer.tile), path: layer.document, tile: layer.tile, jobLayer: index,
     number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips, video: layer.video
   })).filter((row) => row.clips.some((clip) => !clip.cleared));
   /* The layers that wait are first, so the user sees the files that were opened last. */
-  const shownRows = [...topLayerFirst(stagedRows), ...topLayerFirst(jobRows)];
+  const shownRows = [...stagedRows, ...jobRows];
+  const rowsNow = useRef({ staged: stagedRows, job: jobRows });
+  rowsNow.current = { staged: stagedRows, job: jobRows };
+
+  /* Moves a row in its part of the list. A layer that waits moves in the window; a job's layer moves in the job, so the job makes it in its new place. */
+  const moveRow = (section: Section, from: number, to: number) => {
+    if (section === "s") {
+      const keys = moved(rowsNow.current.staged.map((row) => row.key), from, to);
+      setOrder((current) => [...keys, ...current.filter((key) => !keys.includes(key))]);
+      return;
+    }
+    const rows = rowsNow.current.job;
+    if (!rows[from] || !rows[to]) return;
+    void queueMoveLayer(rows[from].jobLayer, rows[to].jobLayer).catch((error) => setMessage(String(error)));
+  };
+
+  /* The place in a part of the list where a dragged row goes: before the first row whose middle is below the pointer. */
+  const dropPlace = (section: Section, y: number) => {
+    const rows = [...(listRef.current?.querySelectorAll<HTMLElement>(`[data-drag="${section}"]`) ?? [])];
+    const place = rows.findIndex((row) => {
+      const box = row.getBoundingClientRect();
+      return y < box.top + box.height / 2;
+    });
+    return place < 0 ? rows.length : place;
+  };
+
+  /**
+   * Drags a row by its grip. The list scrolls when the pointer is near its
+   * top or bottom. Esc cancels the drag. The row moves when the user
+   * releases the mouse button.
+   */
+  const startDrag = (event: ReactPointerEvent<HTMLElement>, section: Section, from: number) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const grip = event.currentTarget;
+    grip.setPointerCapture(event.pointerId);
+    let over = from;
+    setDrag({ section, from, over });
+    const move = (moveEvent: PointerEvent) => {
+      const list = listRef.current;
+      if (list) {
+        const box = list.getBoundingClientRect();
+        if (moveEvent.clientY < box.top + 28) list.scrollTop -= 14;
+        else if (moveEvent.clientY > box.bottom - 28) list.scrollTop += 14;
+      }
+      over = dropPlace(section, moveEvent.clientY);
+      setDrag((current) => current && { ...current, over });
+    };
+    const stop = (drop: boolean) => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", release);
+      grip.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", escape);
+      setDrag(null);
+      const to = over > from ? over - 1 : over;
+      if (drop && to !== from) moveRow(section, from, to);
+    };
+    const release = (upEvent: PointerEvent) => {
+      over = dropPlace(section, upEvent.clientY);
+      stop(true);
+    };
+    const cancel = () => stop(false);
+    const escape = (keyEvent: KeyboardEvent) => {
+      if (keyEvent.key !== "Escape") return;
+      keyEvent.preventDefault();
+      if (grip.hasPointerCapture(event.pointerId)) grip.releasePointerCapture(event.pointerId);
+      stop(false);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", release);
+    grip.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", escape);
+  };
   const chosenCount = stagedRows.filter((row) => chosen.has(row.key)).length;
   const hasRemoved = staged.length > 0 && removed.size > 0;
 
@@ -478,7 +563,7 @@ export default function App() {
   const previewLayer = job ? job.layers[snapshot.current?.layer ?? 0] ?? job.layers[0] : null;
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${drag ? "dragging" : ""}`}>
       <TitleBar updateAvailable={!!updateInfo} onAbout={() => setAboutOpen(true)} onSettings={() => setSettingsOpen(true)} />
 
       <section className="setup">
@@ -554,7 +639,7 @@ export default function App() {
               <button className="link-button" onClick={() => setChosen(new Set())}>None</button>
             </div>
           )}
-          <div className="layers-list">
+          <div className="layers-list" ref={listRef}>
             {shownRows.length === 0 && !hasRemoved && (
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
@@ -570,10 +655,32 @@ export default function App() {
               const info = layerInfos.get(row.key);
               /* A layer that waits can always get a new prompt. A job's layer can get one while it has a clip that did not start yet. */
               const canEdit = waits || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
+              /* The row's place in its part of the list, and the line that shows where a dragged row goes. */
+              const section: Section = waits ? "s" : "j";
+              const sectionPlace = waits ? place : place - stagedRows.length;
+              const sectionSize = waits ? stagedRows.length : jobRows.length;
+              const dragHere = drag?.section === section && drag.over !== drag.from && drag.over !== drag.from + 1 ? drag.over : -1;
+              const rowClass = [
+                "layer-row",
+                waits && !chosen.has(row.key) ? "off" : "",
+                drag?.section === section && drag.from === sectionPlace ? "dragged" : "",
+                dragHere === sectionPlace ? "drop-before" : "",
+                dragHere === sectionSize && sectionPlace === sectionSize - 1 ? "drop-after" : ""
+              ].filter(Boolean).join(" ");
               return (
                 <Fragment key={row.id}>
                 {firstOfFile && <FileLine header {...fileActions(row.path, false)} />}
-                <div className={`layer-row ${waits && !chosen.has(row.key) ? "off" : ""}`}>
+                <div className={rowClass} data-drag={section}>
+                  {sectionSize > 1 && (
+                    <span
+                      className="layer-grip"
+                      title={waits ? "Drag to change the order of the layers. The job makes the layers from the top of the list down." : "Drag to change the order in which the job makes the layers"}
+                      aria-label={`Drag ${row.name} to another place`}
+                      onPointerDown={(pointerEvent) => startDrag(pointerEvent, section, sectionPlace)}
+                    >
+                      <DotsSixVertical size={16} weight="bold" />
+                    </span>
+                  )}
                   {waits && <input type="checkbox" checked={chosen.has(row.key)} onChange={() => toggle(row.key)} onClick={(event) => event.stopPropagation()} aria-label={`Make clips of ${row.name}`} />}
                   {info?.thumbnail ? (
                     <button className="layer-thumb zoomable" title="Show this picture large" aria-label={`Show the picture of ${row.name} large`} onClick={(event) => { event.stopPropagation(); zoomLayer(row); }}>
