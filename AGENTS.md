@@ -46,7 +46,8 @@
 - Cancel Clip (`queue_cancel_clip`) removes the clip in work from its layer and
   starts a new runner; the engine stays loaded. A prompt change in a job
   (`queue_set_prompt`) does not raise the generation; the clips that start
-  after it use the new prompt.
+  after it use the new prompt. A done layer's prompt can also change, so
+  Again makes the next video with the new prompt.
 - Again (`queue_new_pass`) makes a done layer's video again from the layer's
   picture: its clips wait again, the new video gets a new file name and takes
   the old one's place in the list, and the old video stays in its folder. It

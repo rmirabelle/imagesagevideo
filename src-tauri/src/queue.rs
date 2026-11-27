@@ -705,16 +705,14 @@ pub fn queue_cancel_clip(app: AppHandle, queue: State<'_, Queue>, engine: State<
 /**
  * Changes a layer's prompt; the job can be running. The clip in work keeps
  * the prompt it started with. Each clip of the layer that starts after
- * this uses the new prompt. The runner goes on, so the generation does not
- * change.
+ * this uses the new prompt. A done layer can also get a new prompt; Again
+ * makes its next video with it. The runner goes on, so the generation does
+ * not change.
  */
 #[tauri::command]
 pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, prompt: String) -> Result<(), String> {
     let mut inner = queue.lock();
     let layer = inner.job.as_mut().and_then(|job| job.layers.get_mut(layer)).ok_or("The job does not have this layer.")?;
-    if layer.video.is_some() {
-        return Err("This layer's video is done, so its prompt cannot change.".into());
-    }
     layer.prompt = prompt.trim().to_string();
     save_job(&app, inner.job.as_ref());
     publish(&app, &inner);

@@ -653,8 +653,9 @@ export default function App() {
               const before = shownRows[place - 1];
               const firstOfFile = !before || fileKey(before.path) !== fileKey(row.path) || (before.jobLayer < 0) !== waits;
               const info = layerInfos.get(row.key);
-              /* A layer that waits can always get a new prompt. A job's layer can get one while it has a clip that did not start yet. */
-              const canEdit = waits || (!row.video && !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed"));
+              /* A layer that waits or is done can always get a new prompt. A job's layer in work can get one while it has a clip that did not start yet. */
+              const canEdit = waits || !!row.video || !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed");
+              const editNote = waits ? "The file does not change." : row.video ? "Again makes the next video with the new prompt." : "The clips of this layer that start after this use the new prompt.";
               /* The row's place in its part of the list, and the line that shows where a dragged row goes. */
               const section: Section = waits ? "s" : "j";
               const sectionPlace = waits ? place : place - stagedRows.length;
@@ -715,7 +716,7 @@ export default function App() {
                           }}
                         />
                         <small>
-                          Enter keeps the prompt. Esc cancels. {waits ? "The file does not change." : "The clips of this layer that start after this use the new prompt."}
+                          Enter keeps the prompt. Esc cancels. {editNote}
                           {waits && prompts.has(row.key) && (
                             <button
                               className="link-button"
@@ -781,7 +782,7 @@ export default function App() {
                   {canEdit && (
                     <button
                       className="layer-remove"
-                      title={waits ? "Change this layer's prompt for the video. The file does not change." : "Change this layer's prompt. The clips of this layer that start after this use the new prompt."}
+                      title={`Change this layer's prompt. ${editNote}`}
                       aria-label={`Change the prompt of ${row.name}`}
                       onClick={(event) => { event.stopPropagation(); setEditing(row.id); }}
                     >
