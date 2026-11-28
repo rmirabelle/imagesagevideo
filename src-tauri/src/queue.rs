@@ -17,7 +17,9 @@ use crate::{
  * each layer keeps its own file and its own clip size. The user
  * chooses how many 5-second clips a video has. The first clip starts from
  * the layer's picture. Each clip after it starts from the last picture of
- * the clip before, with the same prompt, so the clips continue one another.
+ * the clip before, so the clips continue one another. The first clip
+ * follows the layer's prompt. A later clip can have its own prompt; a clip
+ * without one follows the prompt of the clip before (`LayerJob::clip_prompt`).
  * When a layer's clips are all done, they are joined into the layer's video
  * and the clips are deleted.
  *
@@ -60,6 +62,20 @@ pub struct Clip {
     /// The user removed this finished clip from the list. It stays in the layer's video.
     #[serde(default)]
     cleared: bool,
+    /// This clip's own prompt. Empty: the clip follows the prompt of the clip before. The first clip follows the layer's prompt.
+    #[serde(default)]
+    prompt: String,
+}
+
+impl Clip {
+    fn pending(prompt: String) -> Clip {
+        Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false, prompt }
+    }
+
+    /// Makes the clip wait again. It keeps its prompt.
+    fn reset(&mut self) {
+        *self = Clip::pending(std::mem::take(&mut self.prompt));
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -99,6 +115,33 @@ impl LayerJob {
 
     fn all_done(&self) -> bool {
         self.clips.iter().all(|clip| clip.status == ClipStatus::Done)
+    }
+
+    /// The prompt of a clip: its own prompt, or the prompt of the nearest clip before it that has one, or the layer's prompt.
+    fn clip_prompt(&self, clip: usize) -> &str {
+        self.clips
+            .iter()
+            .take(clip + 1)
+            .skip(1)
+            .rev()
+            .map(|clip| clip.prompt.as_str())
+            .find(|prompt| !prompt.is_empty())
+            .unwrap_or(&self.prompt)
+    }
+
+    /**
+     * Gives the layer its prompt and the clips after the first their own
+     * prompts, in order. An empty prompt makes a clip follow the clip before.
+     * A prompt for a clip that the layer does not have is left out.
+     */
+    fn set_prompts(&mut self, prompt: &str, clip_prompts: &[String]) {
+        self.prompt = prompt.trim().to_string();
+        for (place, clip) in self.clips.iter_mut().enumerate().skip(1) {
+            clip.prompt = clip_prompts.get(place - 1).map(|text| text.trim().to_string()).unwrap_or_default();
+        }
+        if let Some(first) = self.clips.first_mut() {
+            first.prompt.clear();
+        }
     }
 }
 
@@ -176,15 +219,26 @@ impl Job {
     /**
      * Removes the clip that is in work from its layer, so the layer's video
      * has one clip less. The clips after it move one place down; the next
-     * one then continues the last done clip. Returns false when no clip is
-     * in work at that place.
+     * one then continues the last done clip. Each clip keeps the prompt it
+     * had: a next clip that followed the removed clip's prompt gets that
+     * prompt as its own. Returns false when no clip is in work at that place.
      */
     fn skip_running(&mut self, layer: usize, clip: usize) -> bool {
-        let Some(clips) = self.layers.get_mut(layer).map(|layer| &mut layer.clips) else { return false };
-        if clips.get(clip).is_none_or(|clip| clip.status != ClipStatus::Running) {
+        let Some(layer_job) = self.layers.get_mut(layer) else { return false };
+        if layer_job.clips.get(clip).is_none_or(|clip| clip.status != ClipStatus::Running) {
             return false;
         }
-        clips.remove(clip);
+        let followed = layer_job.clip_prompt(clip).to_string();
+        if let Some(next) = layer_job.clips.get_mut(clip + 1).filter(|next| next.prompt.is_empty()) {
+            next.prompt = followed;
+        }
+        layer_job.clips.remove(clip);
+        /* A new first clip follows the layer's prompt, so its own prompt becomes the layer's prompt. */
+        if clip == 0 {
+            if let Some(first) = layer_job.clips.first_mut().filter(|first| !first.prompt.is_empty()) {
+                layer_job.prompt = std::mem::take(&mut first.prompt);
+            }
+        }
         true
     }
 
@@ -255,7 +309,7 @@ impl Job {
         }
         layer_job.video = None;
         for clip in &mut layer_job.clips {
-            *clip = Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false };
+            clip.reset();
         }
         true
     }
@@ -469,6 +523,9 @@ pub struct StartLayer {
     tile: String,
     /// The prompt the user wrote in place of the document's prompt. The document itself does not change.
     prompt: Option<String>,
+    /// The own prompts of the clips after the first, in order. An empty prompt makes a clip follow the clip before.
+    #[serde(default)]
+    clip_prompts: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -504,18 +561,20 @@ fn layer_jobs(request: &[StartLayer], clips: usize) -> Result<Vec<LayerJob>, Str
         if jobs.iter().any(|job| job.index == index && job.document == path) {
             continue;
         }
-        jobs.push(LayerJob {
+        let mut job = LayerJob {
             id: 0,
             index,
-            prompt: asked.prompt.as_ref().map(|prompt| prompt.trim().to_string()).unwrap_or_else(|| layer.prompt.clone()),
+            prompt: String::new(),
             tile: layer.tile.clone(),
             name: layer.name.clone(),
-            clips: vec![Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false }; clips],
+            clips: vec![Clip::pending(String::new()); clips],
             video: None,
             document: path,
             clip_width: *clip_width,
             clip_height: *clip_height,
-        });
+        };
+        job.set_prompts(asked.prompt.as_deref().unwrap_or(&layer.prompt), &asked.clip_prompts);
+        jobs.push(job);
     }
     Ok(jobs)
 }
@@ -616,7 +675,7 @@ pub fn resume(app: &AppHandle, queue: &Queue, engine: &Engine) {
     let Some(job) = inner.job.as_mut() else { return };
     for clip in job.layers.iter_mut().flat_map(|layer| &mut layer.clips) {
         if clip.status == ClipStatus::Failed {
-            *clip = Clip { status: ClipStatus::Pending, file: None, error: None, cleared: false };
+            clip.reset();
         }
     }
     spawn_runner(app, queue, engine, &mut inner);
@@ -703,17 +762,17 @@ pub fn queue_cancel_clip(app: AppHandle, queue: State<'_, Queue>, engine: State<
 }
 
 /**
- * Changes a layer's prompt; the job can be running. The clip in work keeps
- * the prompt it started with. Each clip of the layer that starts after
- * this uses the new prompt. A done layer can also get a new prompt; Again
- * makes its next video with it. The runner goes on, so the generation does
- * not change.
+ * Changes a layer's prompt and the own prompts of its clips after the
+ * first; the job can be running. The clip in work keeps the prompt it
+ * started with. Each clip of the layer that starts after this uses its new
+ * prompt. A done layer can also get new prompts; Again makes its next video
+ * with them. The runner goes on, so the generation does not change.
  */
 #[tauri::command]
-pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, prompt: String) -> Result<(), String> {
+pub fn queue_set_prompt(app: AppHandle, queue: State<'_, Queue>, layer: usize, prompt: String, clip_prompts: Vec<String>) -> Result<(), String> {
     let mut inner = queue.lock();
     let layer = inner.job.as_mut().and_then(|job| job.layers.get_mut(layer)).ok_or("The job does not have this layer.")?;
-    layer.prompt = prompt.trim().to_string();
+    layer.set_prompts(&prompt, &clip_prompts);
     save_job(&app, inner.job.as_ref());
     publish(&app, &inner);
     Ok(())
@@ -886,10 +945,11 @@ async fn run(app: AppHandle, queue: Queue, engine: Engine, generation: u64) {
                 if clip >= clips.len() {
                     return;
                 }
+                let prompt = std::mem::take(&mut clips[clip].prompt);
                 match &made {
-                    Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false },
+                    Ok(file) => clips[clip] = Clip { status: ClipStatus::Done, file: Some(file.clone()), error: None, cleared: false, prompt },
                     Err(error) => {
-                        clips[clip] = Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()), cleared: false };
+                        clips[clip] = Clip { status: ClipStatus::Failed, file: None, error: Some(error.clone()), cleared: false, prompt };
                         /* The clips after it have no picture to start from. Retry makes them again, in order. */
                         for later in clips[clip + 1..].iter_mut().filter(|later| later.status == ClipStatus::Pending) {
                             later.status = ClipStatus::Failed;
@@ -1056,7 +1116,7 @@ async fn make_one(
             }
         });
     };
-    let bytes = engine::make_clip(app, engine, &files, &layer_job.prompt, size, image, |step| match step {
+    let bytes = engine::make_clip(app, engine, &files, layer_job.clip_prompt(clip), size, image, |step| match step {
         Step::Loading => report("loading", 0.0),
         Step::Sampling { step, preview } => {
             report("generating", step as f64 / f64::from(VIDEO_STEPS));
@@ -1095,7 +1155,13 @@ mod tests {
                     clips: clips
                         .iter()
                         .enumerate()
-                        .map(|(clip, &status)| Clip { status, file: (status == ClipStatus::Done).then(|| format!("{index}-{clip}.webm")), error: None, cleared: false })
+                        .map(|(clip, &status)| Clip {
+                            status,
+                            file: (status == ClipStatus::Done).then(|| format!("{index}-{clip}.webm")),
+                            error: None,
+                            cleared: false,
+                            prompt: String::new(),
+                        })
                         .collect(),
                     video: None,
                     document: r"D:\Art\My Fox (final).imagesage".into(),
@@ -1174,6 +1240,35 @@ mod tests {
         assert!(job.skip_running(0, 1));
         assert_eq!(job.layers[0].clips.len(), 2);
         assert_eq!(job.next_pending(), Some((0, 1)));
+    }
+
+    #[test]
+    fn each_clip_follows_its_own_prompt_or_the_prompt_before() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Pending, Pending]]);
+        let layer = &mut job.layers[0];
+        layer.set_prompts(" walks in ", &["".into(), " turns away ".into(), "too many".into()]);
+        assert_eq!((layer.clip_prompt(0), layer.clip_prompt(1), layer.clip_prompt(2)), ("walks in", "walks in", "turns away"));
+        layer.set_prompts("walks in", &["sits down".into()]);
+        assert_eq!((layer.clip_prompt(1), layer.clip_prompt(2)), ("sits down", "sits down"));
+        assert_eq!(layer.clips.iter().map(|clip| clip.prompt.as_str()).collect::<Vec<_>>(), ["", "sits down", ""]);
+        /* A clip that waits again keeps its prompt. */
+        layer.clips[1].status = Failed;
+        layer.clips[1].reset();
+        assert_eq!((layer.clips[1].status, layer.clips[1].prompt.as_str()), (Pending, "sits down"));
+    }
+
+    #[test]
+    fn a_cancelled_clip_leaves_the_other_clips_their_prompts() {
+        use ClipStatus::*;
+        let mut job = job(&[[Done, Running, Pending], [Running, Pending, Pending]]);
+        job.layers[0].set_prompts("walks in", &["sits down".into(), "".into()]);
+        assert!(job.skip_running(0, 1));
+        assert_eq!(job.layers[0].clip_prompt(1), "sits down");
+        job.layers[1].set_prompts("walks in", &["sits down".into(), "".into()]);
+        assert!(job.skip_running(1, 0));
+        assert_eq!((job.layers[1].prompt.as_str(), job.layers[1].clip_prompt(1)), ("sits down", "sits down"));
+        assert!(job.layers[1].clips[0].prompt.is_empty());
     }
 
     #[test]

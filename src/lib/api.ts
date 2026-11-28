@@ -30,6 +30,8 @@ export interface Clip {
   error: string | null;
   /** The user removed this finished clip from the list. */
   cleared: boolean;
+  /** This clip's own prompt. Empty: the clip follows the prompt of the clip before. The first clip follows the layer's prompt. */
+  prompt: string;
 }
 
 export interface LayerJob {
@@ -129,15 +131,19 @@ export const openDocument = (path: string) => invoke<DocumentInfo>("open_documen
 /** One layer's own picture, large, as a JPEG data URL. */
 export const layerPicture = (path: string, tile: string) => invoke<string>("layer_picture", { path, tile });
 export const queueGet =() => invoke<Snapshot>("queue_get");
-/** Starts a job, or adds layers to the job that exists. A null prompt means the file's own prompt. */
-export const queueStart = (request: { outputDir: string; clips: number; layers: { document: string; tile: string; prompt: string | null }[] }) =>
+/**
+ * Starts a job, or adds layers to the job that exists. A null prompt means
+ * the file's own prompt. `clipPrompts` are the own prompts of the clips
+ * after the first; an empty one makes its clip follow the clip before.
+ */
+export const queueStart = (request: { outputDir: string; clips: number; layers: { document: string; tile: string; prompt: string | null; clipPrompts: string[] }[] }) =>
   invoke<void>("queue_start", { request });
 export const queuePause = () => invoke<void>("queue_pause");
 export const queueResume = () => invoke<void>("queue_resume");
 export const queueClear = () => invoke<void>("queue_clear");
 export const queueClearDone = () => invoke<void>("queue_clear_done");
-/** Changes the prompt of a job's layer, by the layer's place in the job. The clips of that layer that start after this use it. */
-export const queueSetPrompt = (layer: number, prompt: string) => invoke<void>("queue_set_prompt", { layer, prompt });
+/** Changes the prompts of a job's layer, by the layer's place in the job. The clips of that layer that start after this use them. */
+export const queueSetPrompt = (layer: number, prompt: string, clipPrompts: string[]) => invoke<void>("queue_set_prompt", { layer, prompt, clipPrompts });
 /** Moves a job's layer to another place; `to` is its place after the move. The job makes the layers in their order. */
 export const queueMoveLayer = (from: number, to: number) => invoke<void>("queue_move_layer", { from, to });
 /** Stops the clip in work and removes it from its layer; the job goes on with the next clip. */

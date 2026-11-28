@@ -82,9 +82,21 @@ interface Row {
   jobLayer: number;
   number: number;
   name: string;
+  /** The first clip's prompt: the layer's prompt. */
   prompt: string;
+  /** The own prompts of the clips after the first. An empty one makes its clip follow the clip before. */
+  clipPrompts: string[];
+  /** How many clips the layer's video has: for a layer that waits, the number that Start gives it. */
+  clipCount: number;
   clips: Clip[] | null;
   video: string | null;
+}
+
+/** Clip prompts without spaces at their ends and without empty prompts at the end of the list. */
+function trimmedClipPrompts(texts: string[]): string[] {
+  const trimmed = texts.map((text) => text.trim());
+  while (trimmed.length && !trimmed[trimmed.length - 1]) trimmed.pop();
+  return trimmed;
 }
 
 /** The part of the list a row is in: the layers that wait for Start, or the job's layers. A row moves only in its own part. */
@@ -131,9 +143,10 @@ export default function App() {
   const [sent, setSent] = useState<Set<string>>(new Set());
   /* The prompts the user changed, by layer key. The file does not change; the job gets these prompts. */
   const [prompts, setPrompts] = useState<Map<string, string>>(new Map());
-  /* The row whose prompt is in the text box now. */
+  /* The own prompts of the clips after the first, by layer key, for the layers that wait. A file has no clip prompts. */
+  const [clipPrompts, setClipPrompts] = useState<Map<string, string[]>>(new Map());
+  /* The row whose prompts are in the text boxes now. */
   const [editing, setEditing] = useState<string | null>(null);
-  const editCancelled = useRef(false);
   /* The row whose large picture shows. The small picture shows first, until the large one is read. */
   const [zoom, setZoom] = useState<{ id: string; name: string; src: string } | null>(null);
   /* The row whose prompt went to the clipboard a moment ago. Its button shows a check mark for a short time. */
@@ -256,6 +269,7 @@ export default function App() {
     setRemoved((current) => new Set([...current].filter(stays)));
     setSent((current) => new Set([...current].filter(stays)));
     setPrompts((current) => new Map([...current].filter(([key]) => stays(key))));
+    setClipPrompts((current) => new Map([...current].filter(([key]) => stays(key))));
     setEditing(null);
   };
 
@@ -272,13 +286,19 @@ export default function App() {
       await queueStart({
         outputDir,
         clips: clipsPerLayer,
-        layers: chosenRows.map((row) => ({ document: row.path, tile: row.tile, prompt: prompts.has(row.key) ? row.prompt : null }))
+        layers: chosenRows.map((row) => ({
+          document: row.path,
+          tile: row.tile,
+          prompt: prompts.has(row.key) ? row.prompt : null,
+          clipPrompts: row.clipPrompts.slice(0, row.clipCount - 1)
+        }))
       });
       const sentKeys = new Set([...sent, ...chosenRows.map((row) => row.key)]);
       const done = new Set(staged.filter((file) => !stagedRows.some((row) => fileKey(row.path) === file && !sentKeys.has(row.key))));
       setSent(sentKeys);
       setChosen((current) => new Set([...current].filter((key) => !sentKeys.has(key))));
       setPrompts((current) => new Map([...current].filter(([key]) => !sentKeys.has(key))));
+      setClipPrompts((current) => new Map([...current].filter(([key]) => !sentKeys.has(key))));
       setEditing(null);
       if (done.size) unstage(done);
     } catch (error) {
@@ -301,6 +321,14 @@ export default function App() {
         for (const layer of layers) {
           const original = opened.find((info) => fileKey(info.path) === fileKey(layer.document))?.layers.find((known) => known.tile === layer.tile)?.prompt;
           if (original !== undefined && original !== layer.prompt) next.set(layerKey(layer.document, layer.tile), layer.prompt);
+        }
+        return next;
+      });
+      setClipPrompts((current) => {
+        const next = new Map(current);
+        for (const layer of layers) {
+          const own = trimmedClipPrompts(layer.clips.slice(1).map((clip) => clip.prompt));
+          if (own.length) next.set(layerKey(layer.document, layer.tile), own);
         }
         return next;
       });
@@ -347,6 +375,7 @@ export default function App() {
       setRemoved((current) => new Set([...current].map(renamedKey)));
       setSent((current) => new Set([...current].map(renamedKey)));
       setPrompts((current) => new Map([...current].map(([key, text]) => [renamedKey(key), text])));
+      setClipPrompts((current) => new Map([...current].map(([key, texts]) => [renamedKey(key), texts])));
       setEditing(null);
     } catch (error) {
       setMessage(String(error));
@@ -409,10 +438,26 @@ export default function App() {
     });
   };
 
-  /* For a layer that waits, the window keeps the prompt. For a job's layer, the job gets it at once. */
-  const keepPrompt = (row: Row, text: string) => {
-    if (row.jobLayer < 0) setPrompt(row.key, text);
-    else if (text.trim() !== row.prompt) void queueSetPrompt(row.jobLayer, text).catch((error) => setMessage(String(error)));
+  /**
+   * For a layer that waits, the window keeps the prompts. The clip prompts
+   * after the boxes that show stay, so a larger number of clips gets them
+   * back. For a job's layer, the job gets the prompts at once.
+   */
+  const keepPrompts = (row: Row, text: string, clipTexts: string[]) => {
+    if (row.jobLayer < 0) {
+      setPrompt(row.key, text);
+      const own = trimmedClipPrompts([...clipTexts, ...row.clipPrompts.slice(clipTexts.length)]);
+      setClipPrompts((current) => {
+        const next = new Map(current);
+        if (own.length) next.set(row.key, own);
+        else next.delete(row.key);
+        return next;
+      });
+      return;
+    }
+    const own = trimmedClipPrompts(clipTexts);
+    const changed = text.trim() !== row.prompt || JSON.stringify(own) !== JSON.stringify(trimmedClipPrompts(row.clipPrompts));
+    if (changed) void queueSetPrompt(row.jobLayer, text, own).catch((error) => setMessage(String(error)));
   };
 
   /* Puts a row's prompt on the clipboard. This is the only way to get the prompt of a layer whose prompt cannot change. */
@@ -446,14 +491,18 @@ export default function App() {
     const info = known.get(file);
     return (info?.layers ?? []).map((layer, index) => {
       const key = layerKey(info!.path, layer.tile);
-      return { id: `s:${key}`, key, path: info!.path, tile: layer.tile, jobLayer: -1, number: index + 1, name: layer.name, prompt: prompts.get(key) ?? layer.prompt, clips: null, video: null };
+      return {
+        id: `s:${key}`, key, path: info!.path, tile: layer.tile, jobLayer: -1, number: index + 1, name: layer.name,
+        prompt: prompts.get(key) ?? layer.prompt, clipPrompts: clipPrompts.get(key) ?? [], clipCount: clipsPerLayer, clips: null, video: null
+      };
     });
   }).filter((row) => !removed.has(row.key) && !sent.has(row.key))
     .sort((a, b) => (order.indexOf(a.key) + 1 || Infinity) - (order.indexOf(b.key) + 1 || Infinity));
   /* The job's layers that have a clip in the list, in the order the job makes them. */
   const jobRows: Row[] = (job?.layers ?? []).map((layer, index) => ({
     id: `j:${index}`, key: layerKey(layer.document, layer.tile), path: layer.document, tile: layer.tile, jobLayer: index,
-    number: layer.index + 1, name: layer.name, prompt: layer.prompt, clips: layer.clips, video: layer.video
+    number: layer.index + 1, name: layer.name, prompt: layer.prompt, clipPrompts: layer.clips.slice(1).map((clip) => clip.prompt),
+    clipCount: layer.clips.length, clips: layer.clips, video: layer.video
   })).filter((row) => row.clips.some((clip) => !clip.cleared));
   /* The layers that wait are first, so the user sees the files that were opened last. */
   const shownRows = [...stagedRows, ...jobRows];
@@ -644,7 +693,7 @@ export default function App() {
               <div className="empty">
                 <FilmStrip size={44} weight="thin" />
                 <p>Open Image Sage documents or photos.</p>
-                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. All clips follow the layer's prompt. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here. You can open more files while a job runs.</span>
+                <span>Each layer becomes one Wan 2.2 video, made of 5-second clips. The first clip starts from the layer's picture; each clip after it continues the clip before. Each clip can have its own prompt; a clip without one follows the prompt of the clip before. A photo (PNG, JPEG or WebP) is one layer; you write its prompt here. You can open more files while a job runs.</span>
               </div>
             )}
             {shownRows.map((row, place) => {
@@ -655,7 +704,9 @@ export default function App() {
               const info = layerInfos.get(row.key);
               /* A layer that waits or is done can always get a new prompt. A job's layer in work can get one while it has a clip that did not start yet. */
               const canEdit = waits || !!row.video || !!row.clips?.some((clip) => clip.status === "pending" || clip.status === "failed");
-              const editNote = waits ? "The file does not change." : row.video ? "Again makes the next video with the new prompt." : "The clips of this layer that start after this use the new prompt.";
+              const editNote = waits ? "The file does not change." : row.video ? "Again makes the next video with the new prompts." : "The clips of this layer that start after this use the new prompts.";
+              /* The clips after the first that have their own prompt. The other clips follow the clip before. */
+              const ownPrompts = row.clipPrompts.slice(0, row.clipCount - 1).map((text, index) => ({ clip: index + 2, text })).filter(({ text }) => text);
               /* The row's place in its part of the list, and the line that shows where a dragged row goes. */
               const section: Section = waits ? "s" : "j";
               const sectionPlace = waits ? place : place - stagedRows.length;
@@ -696,43 +747,27 @@ export default function App() {
                       {info?.hidden && <span className="layer-hidden" title="This layer is turned off in Image Sage"><EyeSlash size={13} /></span>}
                     </div>
                     {canEdit && editing === row.id ? (
-                      <div className="layer-prompt-edit" onClick={(event) => event.stopPropagation()}>
-                        <textarea
-                          rows={3}
-                          autoFocus
-                          spellCheck={false}
-                          defaultValue={row.prompt}
-                          placeholder="No prompt: Wan 2.2 chooses the motion."
-                          aria-label={`The prompt of ${row.name}`}
-                          onFocus={(event) => { editCancelled.current = false; event.currentTarget.select(); }}
-                          onBlur={(event) => {
-                            if (!editCancelled.current) keepPrompt(row, event.currentTarget.value);
-                            editCancelled.current = false;
-                            setEditing(null);
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === "Escape") { editCancelled.current = true; event.currentTarget.blur(); }
-                            else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.blur(); }
-                          }}
-                        />
-                        <small>
-                          Enter keeps the prompt. Esc cancels. {editNote}
-                          {waits && prompts.has(row.key) && (
-                            <button
-                              className="link-button"
-                              onMouseDown={(event) => event.preventDefault()}
-                              onClick={() => { editCancelled.current = true; setPrompt(row.key, info?.prompt ?? ""); setEditing(null); }}
-                            >
-                              Restore the file's prompt
-                            </button>
-                          )}
-                        </small>
-                      </div>
+                      <PromptEditor
+                        name={row.name}
+                        prompt={row.prompt}
+                        clipPrompts={row.clipPrompts}
+                        clipCount={row.clipCount}
+                        note={editNote}
+                        onRestore={waits && prompts.has(row.key) ? () => setPrompt(row.key, info?.prompt ?? "") : null}
+                        onKeep={(text, clipTexts) => keepPrompts(row, text, clipTexts)}
+                        onClose={() => setEditing(null)}
+                      />
                     ) : (
-                      <div className="layer-prompt" title={row.prompt}>
-                        {row.prompt || "No prompt: Wan 2.2 chooses the motion."}
-                        {waits && prompts.has(row.key) && <em> (changed)</em>}
-                      </div>
+                      <>
+                        <div className="layer-prompt" title={row.prompt}>
+                          {ownPrompts.length > 0 && <b>Clip 1</b>}
+                          {row.prompt || "No prompt: Wan 2.2 chooses the motion."}
+                          {waits && (prompts.has(row.key) || ownPrompts.length > 0) && <em> (changed)</em>}
+                        </div>
+                        {ownPrompts.map(({ clip, text }) => (
+                          <div key={clip} className="layer-prompt" title={text}><b>Clip {clip}</b>{text}</div>
+                        ))}
+                      </>
                     )}
                     {row.video && <FileLine {...fileActions(row.video, true)} />}
                   </div>
@@ -782,8 +817,8 @@ export default function App() {
                   {canEdit && (
                     <button
                       className="layer-remove"
-                      title={`Change this layer's prompt. ${editNote}`}
-                      aria-label={`Change the prompt of ${row.name}`}
+                      title={`Change this layer's prompts. Each clip can have its own prompt. ${editNote}`}
+                      aria-label={`Change the prompts of ${row.name}`}
                       onClick={(event) => { event.stopPropagation(); setEditing(row.id); }}
                     >
                       <PencilSimple size={15} />
@@ -940,6 +975,81 @@ export default function App() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+interface PromptEditorProps {
+  name: string;
+  prompt: string;
+  clipPrompts: string[];
+  clipCount: number;
+  note: string;
+  /** Gives the layer the file's prompt again; null when the prompt did not change. */
+  onRestore: (() => void) | null;
+  onKeep: (prompt: string, clipPrompts: string[]) => void;
+  onClose: () => void;
+}
+
+/**
+ * The text boxes for a layer's prompts: one box for each clip. The first
+ * clip follows the layer's prompt. An empty box of a later clip makes that
+ * clip follow the prompt of the clip before. Enter, or a click out of the
+ * boxes, keeps the prompts; Esc cancels. Tab goes to the next box.
+ */
+function PromptEditor({ name, prompt, clipPrompts, clipCount, note, onRestore, onKeep, onClose }: PromptEditorProps) {
+  const boxes = useRef<HTMLDivElement>(null);
+  const ended = useRef(false);
+  const count = Math.max(1, clipCount);
+  const end = (keep: boolean) => {
+    if (ended.current) return;
+    ended.current = true;
+    if (keep) {
+      const texts = [...(boxes.current?.querySelectorAll("textarea") ?? [])].map((box) => box.value);
+      onKeep(texts[0] ?? "", texts.slice(1));
+    }
+    onClose();
+  };
+  return (
+    <div
+      className="layer-prompt-edit"
+      ref={boxes}
+      onClick={(event) => event.stopPropagation()}
+      onBlur={(event) => { if (!boxes.current?.contains(event.relatedTarget as Node | null)) end(true); }}
+    >
+      {/* It can take the focus, so a click on its scroll bar does not end the edit. */}
+      <div className="clip-prompts" tabIndex={-1}>
+        {Array.from({ length: count }, (_, clip) => (
+          <label key={clip}>
+            {count > 1 && <span>Clip {clip + 1}</span>}
+            <textarea
+              rows={count > 1 ? 2 : 3}
+              autoFocus={clip === 0}
+              spellCheck={false}
+              defaultValue={clip === 0 ? prompt : clipPrompts[clip - 1] ?? ""}
+              placeholder={clip === 0 ? "No prompt: Wan 2.2 chooses the motion." : `Empty: the same prompt as clip ${clip}.`}
+              aria-label={count > 1 ? `The prompt of clip ${clip + 1} of ${name}` : `The prompt of ${name}`}
+              onFocus={(event) => event.currentTarget.select()}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") { event.preventDefault(); end(false); }
+                else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); end(true); }
+              }}
+            />
+          </label>
+        ))}
+      </div>
+      <small>
+        Enter keeps the {count > 1 ? "prompts. Tab goes to the next clip" : "prompt"}. Esc cancels. {note}
+        {onRestore && (
+          <button
+            className="link-button"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => { ended.current = true; onRestore(); onClose(); }}
+          >
+            Restore the file's prompt
+          </button>
+        )}
+      </small>
     </div>
   );
 }

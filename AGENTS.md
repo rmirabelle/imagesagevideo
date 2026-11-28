@@ -48,6 +48,17 @@
   (`queue_set_prompt`) does not raise the generation; the clips that start
   after it use the new prompt. A done layer's prompt can also change, so
   Again makes the next video with the new prompt.
+- Each clip can have its own prompt. Clip 1 follows the layer's prompt
+  (`LayerJob.prompt`); a later clip follows its own `Clip.prompt`, or, when
+  that is empty, the prompt of the clip before (`LayerJob::clip_prompt`).
+  A clip keeps its prompt when it waits again (Retry, Again) and when Cancel
+  Clip removes the clip before it. The window keeps the clip prompts of the
+  layers that wait (`clipPrompts` in `src/App.tsx`) and shows one text box
+  for each clip (`PromptEditor`).
+- The engine already encodes each clip at its highest quality
+  (`output_compression` 100 is the server's default). A clip's last picture
+  cannot be made better without changing the job request, which must stay
+  the same as Image Sage's.
 - Again (`queue_new_pass`) makes a done layer's video again from the layer's
   picture: its clips wait again, the new video gets a new file name and takes
   the old one's place in the list, and the old video stays in its folder. It

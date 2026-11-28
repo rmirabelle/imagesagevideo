@@ -252,7 +252,11 @@ textarea { width: 100%; resize: vertical; line-height: 1.45; }
 .confirm-dialog .dialog-path { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; user-select: text; }
 .layer-prompt { margin-top: 3px; overflow: hidden; color: var(--muted); font-size: 12px; white-space: nowrap; text-overflow: ellipsis; }
 .layer-prompt em { color: var(--accent); font-style: normal; }
+.layer-prompt b { margin-right: 5px; color: #b9bdc9; font-size: 11px; font-weight: 600; }
 .layer-prompt-edit { margin-top: 5px; }
+.layer-prompt-edit .clip-prompts { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.layer-prompt-edit label { display: block; }
+.layer-prompt-edit label span { display: block; margin-bottom: 2px; color: #b9bdc9; font-size: 11px; font-weight: 600; }
 .layer-prompt-edit textarea { display: block; font-size: 12px; }
 .layer-prompt-edit small { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; color: var(--muted); font-size: 11px; }
 
